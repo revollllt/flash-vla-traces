@@ -1,5 +1,7 @@
 # 019 · QKV GEMM 筛选显式考虑 L2 容量
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**保留**。历史代码位置：`0dcb021`。
 
 识别工作集与缓存容量的关系；分别回答局部机制和部署净收益。
@@ -38,6 +40,8 @@ QKV 中间 GEMM 占调用时间的大部分；希望替换此 GEMM，同时保�
 
 - [lab/pi05/expert_qkv_matmul_screen.md](evidence/lab/pi05/expert_qkv_matmul_screen.md)
 - [当时保存的实验总结](evidence/run-note.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（原文，可能含相邻任务）</summary>

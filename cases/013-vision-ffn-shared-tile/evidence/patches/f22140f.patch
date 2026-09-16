@@ -1,0 +1,179 @@
+commit f22140fa759da074c34d5e4727525c6a2d24a4a9
+Add cfg10 bias GEMM for Pi05 vision FFN chains
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.cu b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.cu
+index 83970ff..513eaea 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.cu
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.cu
+@@ -134,6 +134,25 @@ DownGemm::Arguments down_arguments(const void* a, const void* b, const void* gat
+   args.ldr = 0;  // One gate vector broadcast over every output row.
+   return args;
+ }
++// Config 10 serves both vision FFN projections. Bias is converted to FP32
++// and added before the one BF16 store; GELU/residual remain separate stages.
++using VisionBiasGemm = cutlass::gemm::device::GemmUniversal<
++    Element, RowMajor, Element, RowMajor, Element, RowMajor, float,
++    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
++    cutlass::gemm::GemmShape<64, 128, 32>,
++    cutlass::gemm::GemmShape<32, 64, 32>,
++    cutlass::gemm::GemmShape<16, 8, 16>, Epilogue,
++    cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, 5, 8, 8>;
++
++VisionBiasGemm::Arguments vision_bias_arguments(
++    int32_t m, int32_t k, int32_t n, const void* a, const void* b,
++    const void* bias, void* output) {
++  return VisionBiasGemm::Arguments(
++      cutlass::gemm::GemmUniversalMode::kGemm, {m, n, k}, 1,
++      {1.f, 1.f}, a, b, bias, output,
++      int64_t(m) * k, int64_t(k) * n, 0, int64_t(m) * n,
++      int64_t(k), int64_t(n), 0, int64_t(n));
++}
+ }  // namespace
+ 
+ extern "C" int64_t backbone_gemm_workspace(int32_t m, int32_t k, int32_t n) {
+@@ -203,3 +222,37 @@ extern "C" int32_t expert_down_run(void* handle, void* stream) {
+ extern "C" void expert_down_destroy(void* handle) {
+   delete static_cast<DownGemm*>(handle);
+ }
++
++extern "C" int64_t vision_bias_gemm_workspace(int32_t m, int32_t k, int32_t n) {
++  return static_cast<int64_t>(VisionBiasGemm::get_workspace_size(
++      vision_bias_arguments(m, k, n, nullptr, nullptr, nullptr, nullptr)));
++}
++
++extern "C" int32_t vision_bias_gemm_plan(
++    int32_t m, int32_t k, int32_t n, const void* a, const void* b,
++    const void* bias, void* output, void* workspace, void* stream, void** handle) {
++  const auto args = vision_bias_arguments(m, k, n, a, b, bias, output);
++  cutlass::Status status = VisionBiasGemm::can_implement(args);
++  if (status != cutlass::Status::kSuccess)
++    return kCutlassError + static_cast<int32_t>(status);
++  auto* plan = new VisionBiasGemm;
++  status = plan->initialize(args, workspace, static_cast<cudaStream_t>(stream));
++  if (status != cutlass::Status::kSuccess) {
++    delete plan;
++    return kCutlassError + static_cast<int32_t>(status);
++  }
++  *handle = plan;
++  return 0;
++}
++
++extern "C" int32_t vision_bias_gemm_run(void* handle, void* stream) {
++  const cutlass::Status status =
++      static_cast<VisionBiasGemm*>(handle)->run(static_cast<cudaStream_t>(stream));
++  if (status != cutlass::Status::kSuccess)
++    return kCutlassError + static_cast<int32_t>(status);
++  return static_cast<int32_t>(cudaGetLastError());
++}
++
++extern "C" void vision_bias_gemm_destroy(void* handle) {
++  delete static_cast<VisionBiasGemm*>(handle);
++}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_vision.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_vision.py
+new file mode 100644
+index 0000000..70d2c94
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_vision.py
+@@ -0,0 +1,102 @@
++"""Pi0.5 vision FFN on one CUTLASS bias-GEMM tile and existing pointwise stages.
++
++Config 10 preserves FP32 accumulation plus BF16 bias before its BF16 output.
++Up then applies the existing GELU; down adds that BF16 projection to out.
++Plans and device workspaces belong to the wrapper instance and runner scratch.
++"""
++from __future__ import annotations
++
++import ctypes
++import weakref
++
++import torch
++
++from . import cutlass_backbone, fused_vision
++
++NAMES = frozenset({"vision_encoder_norm_ffn_up", "vision_encoder_ffn_down_residual"})
++
++
++def _library():
++    library = cutlass_backbone._library()
++    library.vision_bias_gemm_workspace.argtypes = [ctypes.c_int32] * 3
++    library.vision_bias_gemm_workspace.restype = ctypes.c_int64
++    library.vision_bias_gemm_plan.argtypes = (
++        [ctypes.c_int32] * 3 + [ctypes.c_void_p] * 6
++        + [ctypes.POINTER(ctypes.c_void_p)])
++    library.vision_bias_gemm_plan.restype = ctypes.c_int32
++    library.vision_bias_gemm_run.argtypes = [ctypes.c_void_p] * 2
++    library.vision_bias_gemm_run.restype = ctypes.c_int32
++    library.vision_bias_gemm_destroy.argtypes = [ctypes.c_void_p]
++    library.vision_bias_gemm_destroy.restype = None
++    return library
++
++
++class _Plan:
++    def __init__(self, library, scratch, role, a, weight, bias, output, stream):
++        m, k = a.shape
++        n = weight.shape[1]
++        size = library.vision_bias_gemm_workspace(m, k, n)
++        self.workspace = scratch(role, (max(size, 1),), torch.uint8, a.device)
++        self.tensors = (a, weight, bias, output)
++        self.handle = ctypes.c_void_p()
++        cutlass_backbone._check(library.vision_bias_gemm_plan(
++            m, k, n, a.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr(),
++            self.workspace.data_ptr(), stream, ctypes.byref(self.handle)),
++            f"vision_bias_gemm_plan M={m} K={k} N={n}")
++        self.destroy = weakref.finalize(self, library.vision_bias_gemm_destroy, self.handle)
++
++
++def make_wrappers(scratch, selected_names=None) -> dict:
++    """Bind contiguous CUDA BF16 vision FFN tensors without loading native code.
++
++    Up: x(views,256,1152), norm vectors(1152), weight(1152,4304), bias(4304),
++    out(views,256,4304). Down: x(views,256,4304), weight(4304,1152), bias(1152),
++    out(views,256,1152), with out containing the initial residual. Warmup
++    plans all pointer sets and scratch before capture; replay allocates nothing.
++    """
++    names = NAMES if selected_names is None else set(selected_names)
++    library = pointwise = None
++    plans = {}
++    role = f"pi05_vision_streamk_{id(plans)}"
++
++    def gemm(a, weight, bias, output, stream):
++        nonlocal library
++        key = (a.data_ptr(), weight.data_ptr(), bias.data_ptr(), output.data_ptr())
++        plan = plans.get(key)
++        if plan is None:
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError("vision GEMM pointer set was not warmed before capture")
++            if library is None:
++                library = _library()
++            plan = _Plan(library, scratch, role, a, weight, bias, output, stream)
++            plans[key] = plan
++        cutlass_backbone._check(library.vision_bias_gemm_run(plan.handle, stream),
++                               f"vision_bias_gemm_run M={a.shape[0]} K={a.shape[1]}")
++
++    def vision_encoder_norm_ffn_up(x, norm_w, norm_b, weight, bias, out):
++        nonlocal pointwise
++        normalized = fused_vision._norm(x, norm_w, norm_b, scratch)
++        stream = torch.cuda.current_stream().cuda_stream
++        gemm(normalized, weight, bias, out.view(-1, 4304), stream)
++        if pointwise is None:
++            pointwise = fused_vision._library()
++        cutlass_backbone._check(pointwise.pi05_vision_gelu_launch(
++            out.data_ptr(), out.numel(), stream), "pi05_vision_gelu")
++        return out
++
++    def vision_encoder_ffn_down_residual(x, weight, bias, res, out):
++        projected = scratch(f"{role}_projection", (x.numel() // 4304, 1152),
++                            x.dtype, x.device)
++        gemm(x.view(-1, 4304), weight, bias, projected,
++             torch.cuda.current_stream().cuda_stream)
++        out.add_(projected.view_as(out))
++        return out
++
++    wrappers = {
++        "vision_encoder_norm_ffn_up": vision_encoder_norm_ffn_up,
++        "vision_encoder_ffn_down_residual": vision_encoder_ffn_down_residual,
++    }
++    return {name: wrappers[name] for name in names}
++
++
++__all__ = ["NAMES", "make_wrappers"]

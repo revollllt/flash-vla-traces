@@ -1,0 +1,16 @@
+commit 76690072d4c526bdabb807aa3434398a95a1477a
+Deploy shared rounded epilogue for expert output projection
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index 6b342aa..c773c06 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -38,7 +38,7 @@ class Pi05RTX5090(Pi05):
+         "llm_backbone_norm_gated_ffn": "cutlass-backbone",
+         "llm_backbone_ffn_down_residual": "cutlass-backbone",
+         "action_expert_attention": "fused-attention",
+-        "action_expert_out_proj_residual": "fused-residual",
++        "action_expert_out_proj_residual": "cutlass-expert-residual",
+         "action_expert_ffn_down_residual": "cutlass-expert-residual",
+         "action_expert_action_out_proj": "fused-qkv",
+     }

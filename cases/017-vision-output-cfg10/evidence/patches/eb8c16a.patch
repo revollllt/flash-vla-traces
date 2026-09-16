@@ -1,0 +1,15 @@
+commit eb8c16a18c70dbf0d760db358e19fc6ab4522d38
+Route vision output projection through the shared CUTLASS tile
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index d0d976c..e8a70aa 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -30,6 +30,7 @@ class Pi05RTX5090(Pi05):
+     #: Native pointwise fusion around the existing bf16 GEMMs.
+     plan: Mapping[str, str] = {
+         "vision_encoder_norm_qkv": "cutlass-vision",
++        "vision_encoder_out_proj_residual": "cutlass-vision",
+         "vision_encoder_norm_ffn_up": "cutlass-vision",
+         "vision_encoder_ffn_down_residual": "cutlass-vision",
+         "action_expert_norm_gated_ffn": "dual-ffn",

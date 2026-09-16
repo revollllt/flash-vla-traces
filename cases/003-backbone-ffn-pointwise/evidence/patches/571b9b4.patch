@@ -1,0 +1,35 @@
+commit 571b9b4fc5177dac96a0d8404b14195ef8ddcff6
+Route RTX 5090 Pi0.5 backbone FFN through native fusion
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+index d87c2eb..167d44f 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+@@ -6,8 +6,14 @@ from flash_vla.runtime.registry import Registry
+ from . import torch_ops as _torch
+ from . import fused_ffn as _fused_ffn
+ from . import fused_qkv as _fused_qkv
++from . import fused_backbone as _fused_backbone
+ 
+-BACKENDS = {"torch": _torch, "fused-ffn": _fused_ffn, "fused-qkv": _fused_qkv}
++BACKENDS = {
++    "torch": _torch,
++    "fused-ffn": _fused_ffn,
++    "fused-qkv": _fused_qkv,
++    "fused-backbone": _fused_backbone,
++}
+ 
+ REGISTRY = Registry(BACKENDS, default="torch")
+ 
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index 2301ce8..42bc296 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -31,6 +31,7 @@ class Pi05RTX5090(Pi05):
+     plan: Mapping[str, str] = {
+         "action_expert_norm_gated_ffn": "fused-ffn",
+         "action_expert_norm_qkv_rope": "fused-qkv",
++        "llm_backbone_norm_gated_ffn": "fused-backbone",
+     }
+     reference_plan: Mapping[str, str] = {}
+ 

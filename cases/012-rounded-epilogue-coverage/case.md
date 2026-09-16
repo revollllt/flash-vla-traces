@@ -1,5 +1,7 @@
 # 012 · 融合门控 epilogue，并用常量探针定位输出覆盖错误
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**修复后保留**。历史代码位置：`df996b8`。
 
 先把巨大数值错误降为廉价的覆盖测试；失败路径是案例的一部分。
@@ -38,6 +40,8 @@ cfg9 加 rounded epilogue 可能减少临时张量和启动。首个真实数值
 
 - [lab/pi05/rtx5090_expert_epilogue.md](evidence/lab/pi05/rtx5090_expert_epilogue.md)
 - [当时保存的实验总结](evidence/run-note.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（原文，可能含相邻任务）</summary>

@@ -1,0 +1,35 @@
+commit 4d53ad73357ec8aa88e7b9ae9f6cded7a61bcdfd
+Deploy fused masked expert attention on RTX 5090 Pi0.5
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+index ee32136..c89fb2a 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+@@ -8,6 +8,7 @@ from . import fused_ffn as _fused_ffn
+ from . import fused_qkv as _fused_qkv
+ from . import fused_backbone as _fused_backbone
+ from . import packed_ffn as _packed_ffn
++from . import fused_attention as _fused_attention
+ 
+ BACKENDS = {
+     "torch": _torch,
+@@ -15,6 +16,7 @@ BACKENDS = {
+     "fused-qkv": _fused_qkv,
+     "fused-backbone": _fused_backbone,
+     "packed-ffn": _packed_ffn,
++    "fused-attention": _fused_attention,
+ }
+ 
+ REGISTRY = Registry(BACKENDS, default="torch")
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index 6349307..d199448 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -32,6 +32,7 @@ class Pi05RTX5090(Pi05):
+         "action_expert_norm_gated_ffn": "packed-ffn",
+         "action_expert_norm_qkv_rope": "fused-qkv",
+         "llm_backbone_norm_gated_ffn": "fused-backbone",
++        "action_expert_attention": "fused-attention",
+     }
+     reference_plan: Mapping[str, str] = {}
+ 

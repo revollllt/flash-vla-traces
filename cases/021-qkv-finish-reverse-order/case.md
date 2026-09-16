@@ -1,5 +1,7 @@
 # 021 · QKV finish 融合用反向顺序复测确认小收益
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**保留**。历史代码位置：`4de57c9`。
 
 同一套复测规则也允许确认小收益；固定测量顺序后再看结果。
@@ -38,6 +40,8 @@
 
 - [lab/pi05/expert_qkv_finish_screen.md](evidence/lab/pi05/expert_qkv_finish_screen.md)
 - [当时保存的实验总结](evidence/run-note.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（原文，可能含相邻任务）</summary>

@@ -1,0 +1,151 @@
+commit 80cf4201ae98da4ad95df46ebe963c9e06f34524
+Fuse Pi0.5 expert attention score and softmax stages
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_attention.cu b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_attention.cu
+new file mode 100644
+index 0000000..c234a95
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_attention.cu
+@@ -0,0 +1,71 @@
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <math_constants.h>
++#include <cstdint>
++
++// One CTA holds the complete <=1024-key row in registers between reductions.
++__global__ void pi05_attention_softmax(
++    const float* __restrict__ logits,
++    const __nv_bfloat16* __restrict__ mask,
++    __nv_bfloat16* __restrict__ probabilities,
++    int32_t keys, float scale) {
++  const int32_t row = blockIdx.x;
++  const int32_t tid = threadIdx.x;
++  const int32_t lane = tid & 31;
++  const int32_t warp = tid >> 5;
++  float held[4];
++  float maximum = -CUDART_INF_F;
++#pragma unroll
++  for (int32_t i = 0; i < 4; ++i) {
++    const int32_t key = tid + 256 * i;
++    held[i] = key < keys
++        ? logits[int64_t(row) * keys + key] * scale + __bfloat162float(mask[key])
++        : -CUDART_INF_F;
++    maximum = fmaxf(maximum, held[i]);
++  }
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
++  __shared__ float warp_maxima[8];
++  if (lane == 0) warp_maxima[warp] = maximum;
++  // Each warp consumes all eight maxima only after their writers finish.
++  __syncthreads();
++  maximum = lane < 8 ? warp_maxima[lane] : -CUDART_INF_F;
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
++  float sum = 0.0f;
++#pragma unroll
++  for (int32_t i = 0; i < 4; ++i) {
++    held[i] = expf(held[i] - maximum);
++    sum += held[i];
++  }
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    sum += __shfl_xor_sync(0xffffffffu, sum, offset);
++  // Separate storage permits sum producers to overlap maximum consumers.
++  __shared__ float warp_sums[8];
++  if (lane == 0) warp_sums[warp] = sum;
++  __syncthreads();
++  sum = lane < 8 ? warp_sums[lane] : 0.0f;
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    sum += __shfl_xor_sync(0xffffffffu, sum, offset);
++  const float reciprocal = 1.0f / sum;
++#pragma unroll
++  for (int32_t i = 0; i < 4; ++i) {
++    const int32_t key = tid + 256 * i;
++    if (key < keys)
++      probabilities[int64_t(row) * keys + key] =
++          __float2bfloat16_rn(held[i] * reciprocal);
++  }
++}
++
++extern "C" int32_t pi05_attention_softmax_launch(
++    const void* logits, const void* mask, void* probabilities,
++    int32_t queries, int32_t keys, float scale, cudaStream_t stream) {
++  pi05_attention_softmax<<<queries, 256, 0, stream>>>(
++      static_cast<const float*>(logits), static_cast<const __nv_bfloat16*>(mask),
++      static_cast<__nv_bfloat16*>(probabilities), keys, scale);
++  return static_cast<int32_t>(cudaGetLastError());
++}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_attention.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_attention.py
+new file mode 100644
+index 0000000..84e7a27
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_attention.py
+@@ -0,0 +1,65 @@
++"""Pi0.5 expert attention with FP32 score output and fused masked softmax.
++
++BF16 CUDA Q(400,256), K/V(1018,256), and additive mask(1018) produce
++BF16 out(400,256). All rows are contiguous; out may alias Q. This Target's
++<=1024-key softmax consumes the runtime mask, with FP32 scale/reductions and
++BF16 probability rounding before the unchanged P@V matrix multiplication.
++Scratch belongs to the runner; warmup compiles/allocates before graph capture.
++"""
++from __future__ import annotations
++
++import ctypes
++import os
++import subprocess
++from functools import lru_cache, partial
++from pathlib import Path
++
++import torch
++
++NAMES = frozenset({"action_expert_attention"})
++
++
++@lru_cache(maxsize=1)
++def _library():
++    source = Path(__file__).with_suffix(".cu")
++    directory = source.parents[7] / ".cache" / "cuda_ext" / "rtx5090_pi05_fused_attention"
++    directory.mkdir(parents=True, exist_ok=True)
++    output = directory / "fused_attention.so"
++    if not output.exists() or output.stat().st_mtime < source.stat().st_mtime:
++        nvcc = str(Path(os.environ["CUDA_HOME"]) / "bin" / "nvcc")
++        subprocess.run(
++            [nvcc, "-O3", "-std=c++17", "--fmad=false", "--shared", "-Xcompiler",
++             "-fPIC", "-arch=sm_120a", str(source), "-o", str(output)], check=True)
++    lib = ctypes.CDLL(str(output))
++    lib.pi05_attention_softmax_launch.argtypes = (
++        [ctypes.c_void_p] * 3 + [ctypes.c_int32] * 2 + [ctypes.c_float, ctypes.c_void_p])
++    lib.pi05_attention_softmax_launch.restype = ctypes.c_int32
++    return lib
++
++
++def action_expert_attention(Q, K, V, mask, out, prefix_len=None, *, scratch):
++    """Write BF16 attention output on the current stream, including when out is Q."""
++    queries, head_dim = Q.shape
++    keys = K.shape[0]
++    logits = scratch("pi05_attention_logits", (queries, keys), torch.float32, Q.device)
++    probabilities = scratch("pi05_attention_probabilities", (queries, keys), Q.dtype, Q.device)
++    lib = _library()
++    torch.mm(Q, K.T, out_dtype=torch.float32, out=logits)
++    rc = lib.pi05_attention_softmax_launch(
++        logits.data_ptr(), mask.data_ptr(), probabilities.data_ptr(), queries, keys,
++        float(head_dim ** -0.5), torch.cuda.current_stream(Q.device).cuda_stream)
++    if rc:
++        raise RuntimeError(
++            f"pi05_attention_softmax queries={queries}, keys={keys}, threads=256: CUDA error {rc}")
++    torch.mm(probabilities, V, out=out)
++    return out
++
++
++def make_wrappers(scratch, selected_names=None) -> dict:
++    """Bind the selected expert attention wrapper to this runner's scratch."""
++    names = NAMES if selected_names is None else selected_names
++    wrappers = {"action_expert_attention": action_expert_attention}
++    return {name: partial(wrappers[name], scratch=scratch) for name in names}
++
++
++__all__ = ["NAMES", "make_wrappers"]

@@ -1,5 +1,7 @@
 # 045 · 结合 Tensor 活跃度和同频吞吐，避免误读低 occupancy
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**调整优化优先级**。历史代码位置：`7085a4b 之后，011 阶段`。
 
 将资源、活动率、频率与实际工作量一起解释；profile 负责定位，不替代部署测量。
@@ -37,6 +39,8 @@ gate Tensor 活跃度 92.06%，DRAM 14.63%，L2 49.03%；down 为 95.90%/20.36%/
 子任务的任务指令与回报存在加密 payload，因此无法完整恢复委派 prompt。该窗口未导出的通信/编排记录数量为 `{"agent_message": 16, "function_call": 18, "function_call_output": 18}`；这些数量不是独立任务数。我们不补写缺失原话。
 
 - [results/rtx5090-pi05/gpt6-backbone-ncu-prep/README.md](evidence/results/rtx5090-pi05/gpt6-backbone-ncu-prep/README.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（原文，可能含相邻任务）</summary>

@@ -1,0 +1,101 @@
+commit da1ebf57cbe36bb2105515b134dba7930a7957a5
+Fuse Pi0.5 RTX 5090 expert gated residual updates
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.cu b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.cu
+index fd68001..57790fd 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.cu
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.cu
+@@ -76,6 +76,19 @@ __global__ void gated_activation_kernel(const bf16 *__restrict__ gate,
+     }
+   }
+ }
++
++__global__ void gated_residual_kernel(const bf16 *__restrict__ projected,
++                                      const bf16 *__restrict__ gate,
++                                      bf16 *__restrict__ out, int32_t elements) {
++  const int32_t index = blockIdx.x * 256 + threadIdx.x;
++  if (index < elements) {
++    const float product = __bfloat162float(projected[index]) *
++                          __bfloat162float(gate[index % 1024]);
++    // The translation unit uses --fmad=false: torch rounds multiply and add
++    // separately in fp32, after the GEMM has already written its bf16 result.
++    out[index] = __float2bfloat16_rn(product + __bfloat162float(out[index]));
++  }
++}
+ }  // namespace
+ 
+ extern "C" int32_t ada_rms_launch(const void *x, const void *scale, void *a,
+@@ -107,3 +120,12 @@ extern "C" int32_t packed_gated_activation_launch(const void *gate, const void *
+       static_cast<bf16 *>(out), rows * 4096);
+   return static_cast<int32_t>(cudaGetLastError());
+ }
++
++extern "C" int32_t gated_residual_launch(const void *projected, const void *gate,
++                                         void *out, int32_t rows, void *stream) {
++  // Four CTAs per row give 200 independent blocks at the deployed M=50.
++  gated_residual_kernel<<<rows * 4, 256, 0, static_cast<cudaStream_t>(stream)>>>(
++      static_cast<const bf16 *>(projected), static_cast<const bf16 *>(gate),
++      static_cast<bf16 *>(out), rows * 1024);
++  return static_cast<int32_t>(cudaGetLastError());
++}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.py
+index 50b2418..a27389b 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.py
+@@ -44,6 +44,9 @@ def _library():
+     lib.gated_activation_launch.restype = ctypes.c_int32
+     lib.packed_gated_activation_launch.argtypes = lib.gated_activation_launch.argtypes
+     lib.packed_gated_activation_launch.restype = ctypes.c_int32
++    lib.gated_residual_launch.argtypes = [ctypes.c_void_p] * 3 + [
++        ctypes.c_int32, ctypes.c_void_p]
++    lib.gated_residual_launch.restype = ctypes.c_int32
+     return lib
+ 
+ 
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_residual.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_residual.py
+new file mode 100644
+index 0000000..fbccd74
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_residual.py
+@@ -0,0 +1,41 @@
++"""Pi0.5 RTX 5090 expert projections with a fused gated residual update."""
++from __future__ import annotations
++
++import torch
++
++from .fused_ffn import _check, _library
++
++NAMES = ("action_expert_out_proj_residual", "action_expert_ffn_down_residual")
++
++
++def make_wrappers(scratch, selected_names=None) -> dict:
++    """Bind bf16 CUDA MxK @ Kx1024, then out += projection * gate in fp32.
++
++    K is 2048 for the attention projection and 4096 for FFN down; gate is
++    (1024,) and out is contiguous (M, 1024), read and written in place. The
++    bf16 GEMM output lives in scratch. Warmup builds CUDA and allocates this
++    buffer before scratch freezes and the runner captures its graph.
++    """
++    names = set(NAMES) if selected_names is None else set(selected_names)
++    unknown = names - set(NAMES)
++    if unknown:
++        raise KeyError(f"fused residual backend does not implement {sorted(unknown)}")
++    workspaces = {}
++    role = f"pi05_fused_residual_{id(workspaces)}"
++
++    def projection_residual(x, weight, gate, out):
++        rows = x.shape[0]
++        key = (rows, x.dtype, x.device)
++        if key not in workspaces:
++            workspaces[key] = scratch(role, (rows, 1024), x.dtype, x.device)
++        projected = workspaces[key]
++        torch.mm(x, weight, out=projected)
++        _check(_library().gated_residual_launch(
++            projected.data_ptr(), gate.data_ptr(), out.data_ptr(), rows,
++            torch.cuda.current_stream().cuda_stream), "gated_residual", rows)
++        return out
++
++    return {name: projection_residual for name in names}
++
++
++__all__ = ["NAMES", "make_wrappers"]

@@ -1,5 +1,7 @@
 # 023 · 从真实 mask 发现 padding 空间，逐步验证动态 FFN 分桶
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**有条件保留**。历史代码位置：`7869a5a`。
 
 先测廉价静态上限，再支付动态实现成本；正确性输入必须覆盖被优化的分支。
@@ -41,6 +43,8 @@ backbone 缓冲区物理上有 968 行，但实际任务的有效语言前缀会
 - [lab/pi05/runtime_prefix_native_feasibility.md](evidence/lab/pi05/runtime_prefix_native_feasibility.md)
 - [lab/pi05/bucket_switch.md](evidence/lab/pi05/bucket_switch.md)
 - [当时保存的实验总结](evidence/run-note.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（历史路径以代码显示，可能含相邻任务）</summary>

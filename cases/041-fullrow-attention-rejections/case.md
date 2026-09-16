@@ -1,5 +1,7 @@
 # 041 · 完整行 attention 融合两次失败，资源改善不等于加速
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**两个固定映射均拒绝**。历史代码位置：`c6a7d56 / 0325a34`。
 
 资源数据用于提出下一假设，完整链对照用于决定是否保留。
@@ -37,6 +39,8 @@ BM32 为 255 registers、104 B/thread local footprint、66 KiB shared，数值�
 子任务的任务指令与回报存在加密 payload，因此无法完整恢复委派 prompt。该窗口未导出的通信/编排记录数量为 `{"function_call": 25, "function_call_output": 25, "agent_message": 27}`；这些数量不是独立任务数。我们不补写缺失原话。
 
 - [lab/pi05/backbone_fullrow.md](evidence/lab/pi05/backbone_fullrow.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（历史路径以代码显示，可能含相邻任务）</summary>

@@ -1,0 +1,34 @@
+commit c8f5e1567ea90c1a0462dff9f237874e955d9407
+Route RTX 5090 Pi0.5 expert QKV through native fusion
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+index 2692d04..d87c2eb 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+@@ -5,8 +5,9 @@ from flash_vla.runtime.registry import Registry
+ 
+ from . import torch_ops as _torch
+ from . import fused_ffn as _fused_ffn
++from . import fused_qkv as _fused_qkv
+ 
+-BACKENDS = {"torch": _torch, "fused-ffn": _fused_ffn}
++BACKENDS = {"torch": _torch, "fused-ffn": _fused_ffn, "fused-qkv": _fused_qkv}
+ 
+ REGISTRY = Registry(BACKENDS, default="torch")
+ 
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index 2eacccc..2301ce8 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -28,7 +28,10 @@ class Pi05RTX5090(Pi05):
+     registry = REGISTRY
+ 
+     #: Native pointwise fusion around the existing bf16 GEMMs.
+-    plan: Mapping[str, str] = {"action_expert_norm_gated_ffn": "fused-ffn"}
++    plan: Mapping[str, str] = {
++        "action_expert_norm_gated_ffn": "fused-ffn",
++        "action_expert_norm_qkv_rope": "fused-qkv",
++    }
+     reference_plan: Mapping[str, str] = {}
+ 
+     #: H100's `action_expert_norm_gated_ffn` ceiling is a measured H100 number

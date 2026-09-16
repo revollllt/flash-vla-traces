@@ -1,5 +1,7 @@
 # 001 · 保留 GEMM，先融合 Expert FFN 的逐元素链
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**保留**。历史代码位置：`23f3c8b`。
 
 先保留昂贵算子和数值边界，检验外围融合；区分局部估计与部署结果。
@@ -38,6 +40,8 @@ FFN 每次调用约 21 个 launch，包含两次 GEMM，以及 RMS、类型转�
 
 - [lab/pi05/rtx5090_fused_ffn.md](evidence/lab/pi05/rtx5090_fused_ffn.md)
 - [当时保存的实验总结](evidence/run-note.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（原文，可能含相邻任务）</summary>

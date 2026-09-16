@@ -1,0 +1,190 @@
+commit a6da2bbbc64818e616ddcc3c3b6c868044987fc1
+Fuse Pi0.5 vision normalization and activation stages
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_vision.cu b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_vision.cu
+new file mode 100644
+index 0000000..13e38c7
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_vision.cu
+@@ -0,0 +1,96 @@
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// One CTA owns a 1152-value row. Retaining values avoids rereads for variance
++// and the affine transform; centered variance avoids E[x*x] - E[x]^2 cancellation.
++__global__ void pi05_vision_layer_norm(
++    const __nv_bfloat16* __restrict__ x,
++    const __nv_bfloat16* __restrict__ weight,
++    const __nv_bfloat16* __restrict__ bias,
++    __nv_bfloat16* __restrict__ out) {
++  const int32_t row = blockIdx.x;
++  const int32_t tid = threadIdx.x;
++  const int32_t lane = tid & 31;
++  const int32_t warp = tid >> 5;
++  float held[5];
++  float sum = 0.0f;
++#pragma unroll
++  for (int32_t i = 0; i < 5; ++i) {
++    const int32_t col = tid + i * 256;
++    held[i] = col < 1152 ? __bfloat162float(x[int64_t(row) * 1152 + col]) : 0.0f;
++    sum += held[i];
++  }
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    sum += __shfl_xor_sync(0xffffffffu, sum, offset);
++  __shared__ float warp_sums[8];
++  if (lane == 0) warp_sums[warp] = sum;
++  // All row-sum producers finish before any warp consumes their partials.
++  __syncthreads();
++  sum = lane < 8 ? warp_sums[lane] : 0.0f;
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    sum += __shfl_xor_sync(0xffffffffu, sum, offset);
++  const float mean = sum / 1152.0f;
++  float variance = 0.0f;
++#pragma unroll
++  for (int32_t i = 0; i < 5; ++i) {
++    const int32_t col = tid + i * 256;
++    held[i] -= mean;
++    if (col < 1152) variance += held[i] * held[i];
++  }
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    variance += __shfl_xor_sync(0xffffffffu, variance, offset);
++  // Separate storage lets variance writers overlap earlier sum readers.
++  __shared__ float warp_variances[8];
++  if (lane == 0) warp_variances[warp] = variance;
++  __syncthreads();
++  variance = lane < 8 ? warp_variances[lane] : 0.0f;
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    variance += __shfl_xor_sync(0xffffffffu, variance, offset);
++  const float inverse = rsqrtf(variance / 1152.0f + 1e-5f);
++#pragma unroll
++  for (int32_t i = 0; i < 5; ++i) {
++    const int32_t col = tid + i * 256;
++    if (col < 1152)
++      out[int64_t(row) * 1152 + col] = __float2bfloat16_rn(
++          held[i] * inverse * __bfloat162float(weight[col]) + __bfloat162float(bias[col]));
++  }
++}
++
++// Input is the BF16-rounded addmm result. Keep the tanh GELU in FP32 until store.
++__global__ void pi05_vision_gelu(__nv_bfloat16* values, int64_t vectors) {
++  const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++  if (index < vectors) {
++    int4 packed = reinterpret_cast<int4*>(values)[index];
++    auto* elements = reinterpret_cast<__nv_bfloat16*>(&packed);
++#pragma unroll
++    for (int32_t i = 0; i < 8; ++i) {
++      const float x = __bfloat162float(elements[i]);
++      const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
++      elements[i] = __float2bfloat16_rn(0.5f * x * (1.0f + tanhf(inner)));
++    }
++    reinterpret_cast<int4*>(values)[index] = packed;
++  }
++}
++
++extern "C" int32_t pi05_vision_layer_norm_launch(
++    const void* x, const void* weight, const void* bias, void* out,
++    int32_t rows, cudaStream_t stream) {
++  pi05_vision_layer_norm<<<rows, 256, 0, stream>>>(
++      static_cast<const __nv_bfloat16*>(x), static_cast<const __nv_bfloat16*>(weight),
++      static_cast<const __nv_bfloat16*>(bias), static_cast<__nv_bfloat16*>(out));
++  return static_cast<int32_t>(cudaGetLastError());
++}
++
++extern "C" int32_t pi05_vision_gelu_launch(
++    void* values, int64_t elements, cudaStream_t stream) {
++  const int64_t vectors = elements / 8;
++  const int32_t blocks = static_cast<int32_t>((vectors + 255) / 256);
++  pi05_vision_gelu<<<blocks, 256, 0, stream>>>(
++      static_cast<__nv_bfloat16*>(values), vectors);
++  return static_cast<int32_t>(cudaGetLastError());
++}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_vision.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_vision.py
+new file mode 100644
+index 0000000..f058a72
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_vision.py
+@@ -0,0 +1,79 @@
++"""Pi0.5 vision LayerNorm and post-addmm GELU on handwritten CUDA.
++
++BF16 CUDA x(views,256,1152), norm weight/bias(1152) normalize in FP32 and
++round to BF16 before unchanged torch.addmm. QKV writes out(views,256,3456).
++FFN writes out(views,256,4304), applying tanh GELU in place only after addmm
++has rounded to BF16. Scratch is per runner; warmup compiles and allocates it
++before CUDA Graph capture. Rows and affine parameters are contiguous.
++"""
++from __future__ import annotations
++
++import ctypes
++import os
++import subprocess
++from functools import lru_cache, partial
++from pathlib import Path
++
++import torch
++
++NAMES = frozenset({"vision_encoder_norm_qkv", "vision_encoder_norm_ffn_up"})
++
++
++@lru_cache(maxsize=1)
++def _library():
++    source = Path(__file__).with_suffix(".cu")
++    directory = source.parents[7] / ".cache" / "cuda_ext" / "rtx5090_pi05_fused_vision"
++    directory.mkdir(parents=True, exist_ok=True)
++    output = directory / "fused_vision.so"
++    if not output.exists() or output.stat().st_mtime < source.stat().st_mtime:
++        nvcc = str(Path(os.environ["CUDA_HOME"]) / "bin" / "nvcc")
++        subprocess.run(
++            [nvcc, "-O3", "-std=c++17", "--fmad=false", "--shared", "-Xcompiler",
++             "-fPIC", "-arch=sm_120a", str(source), "-o", str(output)], check=True)
++    lib = ctypes.CDLL(str(output))
++    lib.pi05_vision_layer_norm_launch.argtypes = (
++        [ctypes.c_void_p] * 4 + [ctypes.c_int32, ctypes.c_void_p])
++    lib.pi05_vision_layer_norm_launch.restype = ctypes.c_int32
++    lib.pi05_vision_gelu_launch.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p]
++    lib.pi05_vision_gelu_launch.restype = ctypes.c_int32
++    return lib
++
++
++def _norm(x, weight, bias, scratch):
++    rows = x.numel() // 1152
++    normalized = scratch("pi05_vision_normalized", (rows, 1152), x.dtype, x.device)
++    rc = _library().pi05_vision_layer_norm_launch(
++        x.data_ptr(), weight.data_ptr(), bias.data_ptr(), normalized.data_ptr(),
++        rows, torch.cuda.current_stream(x.device).cuda_stream)
++    if rc:
++        raise RuntimeError(f"pi05_vision_layer_norm rows={rows}, threads=256: CUDA error {rc}")
++    return normalized
++
++
++def vision_encoder_norm_qkv(x, norm_w, norm_b, qkv_w, qkv_b, out, *, scratch):
++    """Normalize in FP32 then write the existing BF16 bias-fused QKV projection."""
++    normalized = _norm(x, norm_w, norm_b, scratch)
++    torch.addmm(qkv_b, normalized, qkv_w, out=out.view(-1, 3456))
++    return out
++
++
++def vision_encoder_norm_ffn_up(x, norm_w, norm_b, weight, bias, out, *, scratch):
++    """Normalize and project before in-place GELU of the BF16-rounded projection."""
++    normalized = _norm(x, norm_w, norm_b, scratch)
++    torch.addmm(bias, normalized, weight, out=out.view(-1, 4304))
++    rc = _library().pi05_vision_gelu_launch(
++        out.data_ptr(), out.numel(), torch.cuda.current_stream(out.device).cuda_stream)
++    if rc:
++        raise RuntimeError(f"pi05_vision_gelu elements={out.numel()}, threads=256: CUDA error {rc}")
++    return out
++
++
++def make_wrappers(scratch, selected_names=None) -> dict:
++    """Bind only the selected vision wrappers to the runner's scratch."""
++    names = NAMES if selected_names is None else selected_names
++    wrappers = {"vision_encoder_norm_qkv": vision_encoder_norm_qkv,
++                "vision_encoder_norm_ffn_up": vision_encoder_norm_ffn_up}
++    return {name: partial(wrappers[name], scratch=scratch) for name in names}
++
++
++__all__ = ["NAMES", "make_wrappers"]

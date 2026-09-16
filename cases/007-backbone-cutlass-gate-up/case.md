@@ -1,5 +1,7 @@
 # 007 · 用已有 CUTLASS 配置筛选大 GEMM，并控制库版本
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**保留**。历史代码位置：`594e697`。
 
 复用已有实现，控制版本混杂；小于漂移的 tile 排名不值得固化为结论。
@@ -38,6 +40,8 @@
 
 
 - [当时保存的实验总结](evidence/run-note.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（原文，可能含相邻任务）</summary>

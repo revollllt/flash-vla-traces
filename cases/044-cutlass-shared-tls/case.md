@@ -1,5 +1,7 @@
 # 044 · 用独立/共存探针定位两个动态库共享 TLS 的初始化故障
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**定位故障并修正探针**。历史代码位置：`7085a4b（当时部署）`。
 
 单独能跑、组合失败时，先控制共存状态；修复诊断路径不等于引入运行时补丁。
@@ -37,6 +39,8 @@
 子任务的任务指令与回报存在加密 payload，因此无法完整恢复委派 prompt。该窗口未导出的通信/编排记录数量为 `{"function_call": 16, "function_call_output": 16, "agent_message": 17}`；这些数量不是独立任务数。我们不补写缺失原话。
 
 - [lab/pi05/cutlass_expert_screen.md](evidence/lab/pi05/cutlass_expert_screen.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（原文，可能含相邻任务）</summary>

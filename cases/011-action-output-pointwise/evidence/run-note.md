@@ -1,0 +1,10 @@
+来源：`results/pi05-rtx5090/gpt6-run-01/README.md` 中的 011 节；实验后记录，原文摘录。
+
+## 011 — Action output pointwise fusion, retained
+
+The existing Target-local QKV library adds two dedicated kernels for the action head: private BF16 RMS factor, unchanged BF16 GEMM, and sequential FP32 factor/bias/Euler residual update. The public norm_factor argument remains untouched. All 10 actual-step local outputs and preserved factor buffers matched bitwise. Reset-inclusive 10-call ABBA measured torch 0.234208/0.234160 ms versus fused 0.066256/0.066336 ms. This is a reused 1.745 MB working set, not a cold-weight test.
+
+Full-depth official comparison passed with the same action metrics as 010. Because the estimated gain is small, four fresh-process end-to-end runs used A-B-B-A ordering: prior plan 33.956571/33.942453 ms, candidate 33.743207/33.766837 ms. Both A legs loaded the same complete route map. The mean of the two medians improves by 0.194490 ms; control drift is 0.014118 ms and candidate drift 0.023630 ms. SM clocks ended at 2865/2865/2872/2865 MHz, memory 13801 MHz, temperatures 58/56/57/59 C. This supports a small repeatable gain under the existing unlocked-clock conditions. The older 010 point is not used to attribute this incremental gain. Source 853d1fa.
+
+A matching cold down capture (actual layer-0 A/B/initial residual, alpha=beta=1, C=D) reports tensor activity 95.90%, DRAM 20.36%, L2 50.24%, 303.168 us and effective SM frequency 2.725260 GHz. Useful work is 64.961 GFLOP, or 214.275 TFLOP/s; the measured unit-MMA limit of 512 FLOP/cycle/SM at that same frequency gives 237.207 TFLOP/s. The ratio is 90.33%. Counting the actual 128-row tiles pads M from 968 to 1024: 68.719 GFLOP / 303.168 us is 226.671 TFLOP/s, or 95.56% of the same-frequency limit, close to the tensor activity. This supports M-tail padding as much of the useful-work gap, but it is not guaranteed removable time; smaller tiles also change reuse and scheduling. Gate/down currently justify no repeat of the same 12-tile sweep; other GEMM shapes and fusion boundaries remain candidates.
+

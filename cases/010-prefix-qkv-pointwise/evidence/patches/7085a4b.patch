@@ -1,0 +1,35 @@
+commit 7085a4ba9f9c3e3e31ce6cbe0f6db853f56ec6d3
+Deploy fused prefix QKV on RTX 5090 Pi0.5
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+index dc38c5e..b060e7d 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+@@ -12,6 +12,7 @@ from . import fused_attention as _fused_attention
+ from . import fused_residual as _fused_residual
+ from . import cutlass_backbone as _cutlass_backbone
+ from . import fused_vision as _fused_vision
++from . import fused_prefix_qkv as _fused_prefix_qkv
+ 
+ BACKENDS = {
+     "torch": _torch,
+@@ -23,6 +24,7 @@ BACKENDS = {
+     "fused-residual": _fused_residual,
+     "cutlass-backbone": _cutlass_backbone,
+     "fused-vision": _fused_vision,
++    "fused-prefix-qkv": _fused_prefix_qkv,
+ }
+ 
+ REGISTRY = Registry(BACKENDS, default="torch")
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index 4af1dcc..8f554c9 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -33,6 +33,7 @@ class Pi05RTX5090(Pi05):
+         "vision_encoder_norm_ffn_up": "fused-vision",
+         "action_expert_norm_gated_ffn": "packed-ffn",
+         "action_expert_norm_qkv_rope": "fused-qkv",
++        "llm_backbone_norm_qkv_rope": "fused-prefix-qkv",
+         "llm_backbone_norm_gated_ffn": "cutlass-backbone",
+         "llm_backbone_ffn_down_residual": "cutlass-backbone",
+         "action_expert_attention": "fused-attention",

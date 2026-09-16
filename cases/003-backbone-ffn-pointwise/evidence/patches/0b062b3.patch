@@ -1,0 +1,181 @@
+commit 0b062b37f286a3469ca977b100692963fac6a0a1
+Fuse Pi05 RTX5090 backbone FFN pointwise stages
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_backbone.cu b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_backbone.cu
+new file mode 100644
+index 0000000..401b185
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_backbone.cu
+@@ -0,0 +1,90 @@
++// Pi0.5 backbone: contiguous BF16 rows of width 2048, FP32 nonlinear stages.
++// The gate/up GEMMs round to BF16 before GELU; only the final product rounds
++// again. out is the up input and output of backbone_gelu_mul.
++#include <cstdint>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++namespace {
++constexpr int32_t kWidth = 2048;
++constexpr int32_t kThreads = kWidth / 8;
++
++__device__ __forceinline__ float warp_sum(float value) {
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    value += __shfl_xor_sync(0xffffffffu, value, offset);
++  return value;
++}
++
++__global__ void rms_norm(const __nv_bfloat16* __restrict__ input,
++                         __nv_bfloat16* __restrict__ output) {
++  const int64_t vector = int64_t(blockIdx.x) * kThreads + threadIdx.x;
++  int4 raw = reinterpret_cast<const int4*>(input)[vector];
++  __nv_bfloat16* values = reinterpret_cast<__nv_bfloat16*>(&raw);
++  float squared = 0.f;
++#pragma unroll
++  for (int32_t i = 0; i < 8; ++i) {
++    const float x = __bfloat162float(values[i]);
++    squared += x * x;
++  }
++  squared = warp_sum(squared);
++  __shared__ float warps[kThreads / 32];
++  __shared__ float inverse_rms;
++  if ((threadIdx.x & 31) == 0) warps[threadIdx.x / 32] = squared;
++  // Warp 0 consumes one partial sum written by each warp.
++  __syncthreads();
++  if (threadIdx.x < 32) {
++    squared = threadIdx.x < kThreads / 32 ? warps[threadIdx.x] : 0.f;
++    squared = warp_sum(squared);
++    if (threadIdx.x == 0) inverse_rms = rsqrtf(squared / kWidth + 1e-6f);
++  }
++  // Every warp consumes the row factor produced by lane 0.
++  __syncthreads();
++#pragma unroll
++  for (int32_t i = 0; i < 8; ++i)
++    values[i] = __float2bfloat16_rn(__bfloat162float(values[i]) * inverse_rms);
++  reinterpret_cast<int4*>(output)[vector] = raw;
++}
++
++__global__ void gelu_mul(const __nv_bfloat16* __restrict__ gate,
++                         __nv_bfloat16* __restrict__ up_output,
++                         int64_t vectors) {
++  for (int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++       index < vectors; index += int64_t(gridDim.x) * blockDim.x) {
++    int4 gate_raw = reinterpret_cast<const int4*>(gate)[index];
++    const int4 up_raw = reinterpret_cast<const int4*>(up_output)[index];
++    __nv_bfloat16* g = reinterpret_cast<__nv_bfloat16*>(&gate_raw);
++    const __nv_bfloat16* u = reinterpret_cast<const __nv_bfloat16*>(&up_raw);
++#pragma unroll
++    for (int32_t i = 0; i < 8; ++i) {
++      const float x = __bfloat162float(g[i]);
++      const float activation =
++          0.5f * x * (1.f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
++      g[i] = __float2bfloat16_rn(activation * __bfloat162float(u[i]));
++    }
++    reinterpret_cast<int4*>(up_output)[index] = gate_raw;
++  }
++}
++}  // namespace
++
++extern "C" int32_t backbone_rms_norm(const void* input, void* output,
++                                    int32_t rows, void* stream) {
++  rms_norm<<<rows, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
++      static_cast<const __nv_bfloat16*>(input), static_cast<__nv_bfloat16*>(output));
++  return static_cast<int32_t>(cudaGetLastError());
++}
++
++extern "C" int32_t backbone_gelu_mul(const void* gate, void* up_output,
++                                    int64_t elements, void* stream) {
++  constexpr int32_t threads = 256;
++  // Reuse the 680-CTA pointwise configuration measured by this device's Pi0
++  // implementation; local FFN timing decides whether it transfers to Pi0.5.
++  constexpr int32_t max_blocks = 680;
++  const int64_t vectors = elements / 8;
++  const int32_t required = static_cast<int32_t>((vectors + threads - 1) / threads);
++  const int32_t blocks = required < max_blocks ? required : max_blocks;
++  gelu_mul<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
++      static_cast<const __nv_bfloat16*>(gate),
++      static_cast<__nv_bfloat16*>(up_output), vectors);
++  return static_cast<int32_t>(cudaGetLastError());
++}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_backbone.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_backbone.py
+new file mode 100644
+index 0000000..1fd2d84
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_backbone.py
+@@ -0,0 +1,76 @@
++"""Pi0.5 backbone FFN with CUDA RMSNorm and a fused GELU/product.
++
++The two torch BF16 GEMMs retain the torch route's rounding boundaries.
++The wrapper writes its declared output and x_norm buffers; the runner owns
++its gate workspace. Native launch state belongs to each wrapper factory.
++"""
++from __future__ import annotations
++
++import ctypes
++import os
++import shutil
++import subprocess
++from pathlib import Path
++
++import torch
++
++NAMES = frozenset({"llm_backbone_norm_gated_ffn"})
++_SOURCE = Path(__file__).with_suffix(".cu")
++
++
++def _library():
++    nvcc = os.environ.get("FLASH_VLA_NVCC")
++    if nvcc is None:
++        cuda_home = os.environ.get("CUDA_HOME")
++        nvcc = str(Path(cuda_home) / "bin/nvcc") if cuda_home else shutil.which("nvcc")
++    if nvcc is None:
++        raise RuntimeError("set CUDA_HOME or FLASH_VLA_NVCC, or put nvcc on PATH")
++    directory = _SOURCE.parents[7] / ".cache/cuda_ext/rtx5090_pi05_backbone"
++    directory.mkdir(parents=True, exist_ok=True)
++    output = directory / "libfused_backbone.so"
++    if not output.exists() or output.stat().st_mtime < _SOURCE.stat().st_mtime:
++        subprocess.run(
++            [nvcc, "-O3", "-std=c++17", "--shared", "-Xcompiler", "-fPIC",
++             "-gencode", "arch=compute_120,code=sm_120",
++             str(_SOURCE), "-o", str(output)],
++            check=True,
++        )
++    library = ctypes.CDLL(str(output))
++    library.backbone_rms_norm.argtypes = [
++        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p,
++    ]
++    library.backbone_rms_norm.restype = ctypes.c_int32
++    library.backbone_gelu_mul.argtypes = [
++        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p,
++    ]
++    library.backbone_gelu_mul.restype = ctypes.c_int32
++    return library
++
++
++def make_wrappers(scratch, selected_names=None) -> dict:
++    """Build capture-safe wrappers for this Target's contiguous CUDA BF16 FFN.
++
++    x/x_norm are (M, 2048), weights (2048, 16384), and out (M, 16384).
++    x_norm and out are distinct writable buffers; out temporarily holds up.
++    The runner must warm each shape before freezing the supplied allocator.
++    """
++    library = _library()
++
++    def llm_backbone_norm_gated_ffn(x, gate_w, up_w, out, x_norm):
++        rows = x.shape[0]
++        normed, result = x_norm[:rows], out[:rows]
++        gate = scratch("backbone_ffn_gate", result.shape, x.dtype, x.device)
++        stream = torch.cuda.current_stream().cuda_stream
++        status = library.backbone_rms_norm(x.data_ptr(), normed.data_ptr(), rows, stream)
++        if status:
++            raise RuntimeError(f"backbone_rms_norm M={rows} K=2048: cudaError {status}")
++        torch.mm(normed, gate_w, out=gate)
++        torch.mm(normed, up_w, out=result)
++        status = library.backbone_gelu_mul(
++            gate.data_ptr(), result.data_ptr(), result.numel(), stream)
++        if status:
++            raise RuntimeError(
++                f"backbone_gelu_mul elements={result.numel()}: cudaError {status}")
++        return out
++
++    return {"llm_backbone_norm_gated_ffn": llm_backbone_norm_gated_ffn}

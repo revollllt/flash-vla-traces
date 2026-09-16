@@ -1,20 +1,26 @@
 # Flash-VLA Traces
 
+[中文](README.md) | [English](README.en.md)
+
 记录优化中的证据、尝试与决策，供其他模型学习问题推进方式。
 
-当前内容：[45 个案例的索引](index.md)，其中 12 个具有六步案例、按时间排序的可见轨迹和关键证据。推荐先看 [001 基础融合](cases/001-expert-ffn-fusion/case.md)、[026 提前筛选](cases/026-vision-residual-source-screen/case.md)、[018 不确定而撤回](cases/018-pv-inconclusive-revert/case.md) 与 [021 复测后保留](cases/021-qkv-finish-reverse-order/case.md)。
+当前内容：[45 个案例的索引](index.md)，其中 26 个具有中英文六步案例、按时间排序的可见轨迹和关键证据。推荐先看 [001 基础融合](cases/001-expert-ffn-fusion/case.md)、[026 提前筛选](cases/026-vision-residual-source-screen/case.md)、[018 不确定而撤回](cases/018-pv-inconclusive-revert/case.md) 与 [021 复测后保留](cases/021-qkv-finish-reverse-order/case.md)。
+
+本次新增 14 个案例，补齐除 023/024 外的全部 20 个保留优化。原有 023 案例保留并翻译，024 不在本次展开范围内；其余筛选和诊断案例沿用原有整理范围。
 
 ## 文件组织
 
 ```text
-index.md
+index.md / index.en.md
 cases/<编号>-<主题>/
-  case.md                 # 六步案例；明确事后整理与结论边界
+  case.md / case.en.md    # 中英文六步案例，逐节对应
   trace.jsonl             # 当时公开说明、工具调用、工具返回
-  evidence/README.md      # 来源映射和附带证据入口
+  evidence/README.md / README.en.md  # 双语证据来源入口
   evidence/…              # 原测量、失败结果、历史补丁、实验文档
-experiments/README.md     # 后续学生实验的使用约定
+experiments/README.md / README.en.md  # 双语学生实验使用约定
 ```
+
+中文默认文件名不变，英文使用 `.en.md`，页首互相链接。案例六步正文、索引、仓库说明及证据指南提供中英文版本；trace、命令、测量、补丁、历史公开说明和归档实验文档共用原文。英文案例链接到原始公开说明附录，不把翻译写入原始事件。
 
 每个案例按“瓶颈 → 当时证据 → 假设 → 命令与改动 → 结果 → 保留/回退/继续调查”组织。case.md 是回顾性叙述；trace.jsonl 是保留顺序的原始可见事件摘录。实验文档可能在实验后追加结果，不能把文档里的结论当成 agent 事前已知信息。时间戳用于核对公开说明和工具操作的先后关系。
 
@@ -53,4 +59,4 @@ experiments/README.md     # 后续学生实验的使用约定
 
 案例中原来的 GPU 时隙协调、暂停和授权字样属于历史记录，不是给读者的新指令。学生应提出自己的候选，并按当前工作负载重新验证；不得直接继承案例的速度结论。研究对照的最小约定见 [experiments/README.md](experiments/README.md)。
 
-下一批按索引继续整理，不用文件数量宣称已经完成全部 45 个案例。案例内容及数据尚未对外发布；对外发布时需另行确定许可与引用方式。
+当前仍有 19 项仅列索引（含本次排除的 024），不宣称已经完成全部 45 个案例。案例内容及数据尚未对外发布；对外发布时需另行确定许可与引用方式。

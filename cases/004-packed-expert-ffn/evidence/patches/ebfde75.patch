@@ -1,0 +1,35 @@
+commit ebfde7594551bde089d81da3954e57a4dc61e18a
+Deploy packed expert FFN on RTX 5090 Pi0.5
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+index 167d44f..ee32136 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+@@ -7,12 +7,14 @@ from . import torch_ops as _torch
+ from . import fused_ffn as _fused_ffn
+ from . import fused_qkv as _fused_qkv
+ from . import fused_backbone as _fused_backbone
++from . import packed_ffn as _packed_ffn
+ 
+ BACKENDS = {
+     "torch": _torch,
+     "fused-ffn": _fused_ffn,
+     "fused-qkv": _fused_qkv,
+     "fused-backbone": _fused_backbone,
++    "packed-ffn": _packed_ffn,
+ }
+ 
+ REGISTRY = Registry(BACKENDS, default="torch")
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index 42bc296..6349307 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -29,7 +29,7 @@ class Pi05RTX5090(Pi05):
+ 
+     #: Native pointwise fusion around the existing bf16 GEMMs.
+     plan: Mapping[str, str] = {
+-        "action_expert_norm_gated_ffn": "fused-ffn",
++        "action_expert_norm_gated_ffn": "packed-ffn",
+         "action_expert_norm_qkv_rope": "fused-qkv",
+         "llm_backbone_norm_gated_ffn": "fused-backbone",
+     }

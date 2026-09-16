@@ -1,5 +1,7 @@
 # 016 · 保留 BF16 舍入的双投影融合，局部收益在部署中缩小
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**保留**。历史代码位置：`78c8ca1`。
 
 语义检查决定实现选择；承认局部估计外推失效的部分。
@@ -38,6 +40,8 @@
 
 - [lab/pi05/expert_dual_dot_screen.md](evidence/lab/pi05/expert_dual_dot_screen.md)
 - [当时保存的实验总结](evidence/run-note.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（原文，可能含相邻任务）</summary>

@@ -1,0 +1,16 @@
+commit 5772cf204fe8ffc752e6463eb2eca21a5768e79d
+Route vision QKV through the shared CUTLASS bias tile
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index c773c06..b3ca830 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -29,7 +29,7 @@ class Pi05RTX5090(Pi05):
+ 
+     #: Native pointwise fusion around the existing bf16 GEMMs.
+     plan: Mapping[str, str] = {
+-        "vision_encoder_norm_qkv": "fused-vision",
++        "vision_encoder_norm_qkv": "cutlass-vision",
+         "vision_encoder_norm_ffn_up": "cutlass-vision",
+         "vision_encoder_ffn_down_residual": "cutlass-vision",
+         "action_expert_norm_gated_ffn": "packed-ffn",

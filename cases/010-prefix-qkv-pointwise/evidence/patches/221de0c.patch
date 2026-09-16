@@ -1,0 +1,138 @@
+commit 221de0c711d8eb41b77313a4fa4a92c23df083e3
+Fuse Pi0.5 RTX 5090 backbone QKV pointwise stages
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_prefix_qkv.cu b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_prefix_qkv.cu
+new file mode 100644
+index 0000000..78d552d
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_prefix_qkv.cu
+@@ -0,0 +1,46 @@
++// BF16 pairs from Mx2560 QKV -> Q(Mx2048), K/V(Mx256), with adjacent-pair RoPE.
++#include <cstdint>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++namespace {
++__global__ void rope_scatter(const __nv_bfloat162 *__restrict__ projected,
++                             const __nv_bfloat162 *__restrict__ rope,
++                             __nv_bfloat162 *__restrict__ query,
++                             __nv_bfloat162 *__restrict__ key,
++                             __nv_bfloat162 *__restrict__ value, int32_t pairs) {
++  for (int32_t index = blockIdx.x * blockDim.x + threadIdx.x; index < pairs;
++       index += gridDim.x * blockDim.x) {
++    const int32_t row = index / 1280;
++    const int32_t col = index % 1280;
++    const __nv_bfloat162 input = projected[index];
++    if (col < 1152) {
++      const __nv_bfloat162 cs = rope[row * 128 + col % 128];
++      const float x = __bfloat162float(input.x), y = __bfloat162float(input.y);
++      const float c = __bfloat162float(cs.x), s = __bfloat162float(cs.y);
++      const __nv_bfloat162 rotated = __floats2bfloat162_rn(x * c - y * s, y * c + x * s);
++      if (col < 1024)
++        query[row * 1024 + col] = rotated;
++      else
++        key[row * 128 + col - 1024] = rotated;
++    } else {
++      value[row * 128 + col - 1152] = input;
++    }
++  }
++}
++}  // namespace
++
++extern "C" int32_t prefix_rope_scatter(const void *projected, const void *rope,
++                                        void *query, void *key, void *value,
++                                        int32_t rows, void *stream) {
++  constexpr int32_t threads = 256;
++  // Flat pair traversal, capped like this Target's streaming pointwise stages.
++  const int32_t needed = (rows * 1280 + threads - 1) / threads;
++  const int32_t blocks = needed < 680 ? needed : 680;
++  rope_scatter<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
++      static_cast<const __nv_bfloat162 *>(projected),
++      static_cast<const __nv_bfloat162 *>(rope),
++      static_cast<__nv_bfloat162 *>(query), static_cast<__nv_bfloat162 *>(key),
++      static_cast<__nv_bfloat162 *>(value), rows * 1280);
++  return static_cast<int32_t>(cudaGetLastError());
++}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_prefix_qkv.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_prefix_qkv.py
+new file mode 100644
+index 0000000..77de93f
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_prefix_qkv.py
+@@ -0,0 +1,77 @@
++"""Pi0.5 RTX 5090 backbone RMSNorm, BF16 QKV GEMM and fused RoPE/scatter."""
++from __future__ import annotations
++
++import ctypes
++import os
++from pathlib import Path
++import shutil
++import subprocess
++
++import torch
++
++from . import fused_backbone
++
++NAMES = ("llm_backbone_norm_qkv_rope",)
++_SOURCE = Path(__file__).with_suffix(".cu")
++
++
++def _library():
++    cuda_home = os.environ.get("CUDA_HOME")
++    nvcc = os.environ.get("FLASH_VLA_NVCC") or (
++        str(Path(cuda_home) / "bin/nvcc") if cuda_home else shutil.which("nvcc"))
++    if nvcc is None:
++        raise RuntimeError("set CUDA_HOME or FLASH_VLA_NVCC, or put nvcc on PATH")
++    directory = _SOURCE.parents[7] / ".cache/cuda_ext/rtx5090_pi05_prefix_qkv"
++    directory.mkdir(parents=True, exist_ok=True)
++    output = directory / "libfused_prefix_qkv.so"
++    if not output.exists() or output.stat().st_mtime_ns < max(
++            _SOURCE.stat().st_mtime_ns, Path(__file__).stat().st_mtime_ns):
++        subprocess.run([nvcc, "-O3", "-std=c++17", "--fmad=false", "--shared",
++                        "-Xcompiler", "-fPIC", "-arch=sm_120", str(_SOURCE),
++                        "-o", str(output)], check=True)
++    library = ctypes.CDLL(str(output))
++    library.prefix_rope_scatter.argtypes = [ctypes.c_void_p] * 5 + [
++        ctypes.c_int32, ctypes.c_void_p]
++    library.prefix_rope_scatter.restype = ctypes.c_int32
++    return library
++
++
++def make_wrappers(scratch, selected_names=None) -> dict:
++    """Bind contiguous CUDA BF16 prefix QKV: Mx2048 @ 2048x2560.
++
++    RoPE is (M, 256); Q is (M*8, 256), K/V are (M, 256). The wrapper writes
++    Q/K/V and x_norm (M, 2048). RMSNorm rounds its normalized output to BF16
++    before the GEMM; the GEMM rounds to BF16 before FP32 RoPE arithmetic.
++    Warmup builds native libraries and allocates scratch before the runner
++    freezes it for capture. Libraries and scratch ownership stay within this
++    wrapper factory; constructing the op table requires no CUDA toolchain.
++    """
++    names = set(NAMES) if selected_names is None else set(selected_names)
++    unknown = names - set(NAMES)
++    if unknown:
++        raise KeyError(f"prefix QKV backend does not implement {sorted(unknown)}")
++    libraries = []
++    role = f"pi05_prefix_qkv_{id(libraries)}"
++
++    def llm_backbone_norm_qkv_rope(x, weight_qkv, rope, Q, K, V, x_norm):
++        if not libraries:
++            libraries.extend((fused_backbone._library(), _library()))
++        norm_library, rope_library = libraries
++        rows = x.shape[0]
++        normed = x_norm[:rows]
++        projected = scratch(role, (rows, 2560), x.dtype, x.device)
++        stream = torch.cuda.current_stream().cuda_stream
++        status = norm_library.backbone_rms_norm(x.data_ptr(), normed.data_ptr(), rows, stream)
++        if status:
++            raise RuntimeError(f"backbone_rms_norm M={rows} K=2048: cudaError {status}")
++        torch.mm(normed, weight_qkv, out=projected)
++        status = rope_library.prefix_rope_scatter(
++            projected.data_ptr(), rope.data_ptr(), Q.data_ptr(), K.data_ptr(),
++            V.data_ptr(), rows, stream)
++        if status:
++            raise RuntimeError(f"prefix_rope_scatter M={rows} width=2560: cudaError {status}")
++
++    return {name: llm_backbone_norm_qkv_rope for name in names}
++
++
++__all__ = ["NAMES", "make_wrappers"]

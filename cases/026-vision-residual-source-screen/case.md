@@ -1,5 +1,7 @@
 # 026 · 读源码与已有 trace，提前否决没有减少工作量的融合
 
+[中文](case.md) | [English](case.en.md)
+
 结果：**CPU 筛选停止**。历史代码位置：`005 部署后的已有 profile`。
 
 先确认现有实现到底做了什么；无需 GPU 实验也能排除无收益的重写。
@@ -37,6 +39,8 @@ Vision 的 out projection 与 FFN down 各有三个 launch，看上去可能存�
 子任务的任务指令与回报存在加密 payload，因此无法完整恢复委派 prompt。该窗口未导出的通信/编排记录数量为 `{"function_call": 3, "function_call_output": 3, "agent_message": 3}`；这些数量不是独立任务数。我们不补写缺失原话。
 
 - [results/rtx5090-pi05/gpt6-vision-residual-screen/README.md](evidence/results/rtx5090-pi05/gpt6-vision-residual-screen/README.md)
+
+<a id="original-updates"></a>
 
 <details>
 <summary>按时间查看当时公开的进展说明（原文，可能含相邻任务）</summary>

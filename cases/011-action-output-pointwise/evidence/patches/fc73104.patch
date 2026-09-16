@@ -1,0 +1,144 @@
+commit fc731043760d885117b14b882e9719bc3d19cf3b
+Fuse Pi0.5 action output normalization and Euler update
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_qkv.cu b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_qkv.cu
+index fe552d9..323cae0 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_qkv.cu
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_qkv.cu
+@@ -89,3 +89,63 @@ extern "C" int32_t pi05_qkv_finish(
+       static_cast<__nv_bfloat162*>(v));
+   return static_cast<int32_t>(cudaGetLastError());
+ }
++
++// Action output consumes the RMS factor privately; the public norm_factor
++// argument is deliberately untouched, matching torch_ops.
++__global__ void pi05_action_out_factor(
++    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ factor) {
++  const int32_t row = blockIdx.x;
++  const int32_t tid = threadIdx.x;
++  float sum = 0.0f;
++#pragma unroll
++  for (int32_t i = 0; i < 4; ++i) {
++    const float value = __bfloat162float(x[row * 1024 + tid + i * 256]);
++    sum += value * value;
++  }
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    sum += __shfl_down_sync(0xffffffffu, sum, offset);
++  __shared__ float warp_sums[8];
++  if ((tid & 31) == 0) warp_sums[tid >> 5] = sum;
++  __syncthreads();
++  if (tid < 32) {
++    sum = tid < 8 ? warp_sums[tid] : 0.0f;
++#pragma unroll
++    for (int32_t offset = 16; offset > 0; offset >>= 1)
++      sum += __shfl_down_sync(0xffffffffu, sum, offset);
++    if (tid == 0)
++      factor[row] = __float2bfloat16_rn(rsqrtf(sum / 1024.0f + 1e-6f));
++  }
++}
++
++__global__ void pi05_action_out_update(
++    const __nv_bfloat16* __restrict__ projected,
++    const __nv_bfloat16* __restrict__ factor,
++    const __nv_bfloat16* __restrict__ bias, __nv_bfloat16* out, int32_t elements) {
++  const int32_t index = blockIdx.x * blockDim.x + threadIdx.x;
++  if (index < elements) {
++    // --fmad=false preserves each FP32 operation after the BF16 GEMM result.
++    const float scaled = __bfloat162float(projected[index]) *
++                         __bfloat162float(factor[index / 32]);
++    const float shifted = scaled + __bfloat162float(bias[index % 32]);
++    out[index] = __float2bfloat16_rn(shifted + __bfloat162float(out[index]));
++  }
++}
++
++extern "C" int32_t pi05_action_out_factor_launch(
++    const void* x, void* factor, int32_t rows, cudaStream_t stream) {
++  pi05_action_out_factor<<<rows, 256, 0, stream>>>(
++      static_cast<const __nv_bfloat16*>(x), static_cast<__nv_bfloat16*>(factor));
++  return static_cast<int32_t>(cudaGetLastError());
++}
++
++extern "C" int32_t pi05_action_out_update_launch(
++    const void* projected, const void* factor, const void* bias, void* out,
++    int32_t rows, cudaStream_t stream) {
++  pi05_action_out_update<<<(rows * 32 + 255) / 256, 256, 0, stream>>>(
++      static_cast<const __nv_bfloat16*>(projected),
++      static_cast<const __nv_bfloat16*>(factor),
++      static_cast<const __nv_bfloat16*>(bias), static_cast<__nv_bfloat16*>(out),
++      rows * 32);
++  return static_cast<int32_t>(cudaGetLastError());
++}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_qkv.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_qkv.py
+index f8fcafd..7e9abd6 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_qkv.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_qkv.py
+@@ -1,10 +1,12 @@
+-"""Pi0.5 expert QKV with fused CUDA normalization and projection epilogue.
++"""Pi0.5 expert QKV and action output with fused CUDA pointwise stages.
+ 
+ For BF16 CUDA x(M,1024), scale(1024), weight(1024,2560), bias(2560),
+ rope(M,256), this writes Q(M*8,256), K/V(M,256), and norm_factor(M).
+ All rows are contiguous; K/V may be slices of the layer KV cache. Two scratch
+ buffers belong to the runner. Warmup builds the library and allocates them;
+-subsequent calls are CUDA Graph safe on the current stream.
++subsequent calls are CUDA Graph safe on the current stream. The action output
++wrapper uses weight(1024,32), bias(32), and out(M,32); it privately computes the
++BF16 RMS factor and leaves its norm_factor argument unchanged.
+ """
+ from __future__ import annotations
+ 
+@@ -16,7 +18,7 @@ from pathlib import Path
+ 
+ import torch
+ 
+-NAMES = frozenset({"action_expert_norm_qkv_rope"})
++NAMES = frozenset({"action_expert_norm_qkv_rope", "action_expert_action_out_proj"})
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -35,6 +37,12 @@ def _library():
+     lib.pi05_qkv_prepare.restype = ctypes.c_int32
+     lib.pi05_qkv_finish.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int32, ctypes.c_void_p]
+     lib.pi05_qkv_finish.restype = ctypes.c_int32
++    lib.pi05_action_out_factor_launch.argtypes = (
++        [ctypes.c_void_p] * 2 + [ctypes.c_int32, ctypes.c_void_p])
++    lib.pi05_action_out_factor_launch.restype = ctypes.c_int32
++    lib.pi05_action_out_update_launch.argtypes = (
++        [ctypes.c_void_p] * 4 + [ctypes.c_int32, ctypes.c_void_p])
++    lib.pi05_action_out_update_launch.restype = ctypes.c_int32
+     return lib
+ 
+ 
+@@ -59,10 +67,29 @@ def action_expert_norm_qkv_rope(
+         raise RuntimeError(f"pi05_qkv_finish blocks={m * 5}, threads=256: CUDA error {rc}")
+ 
+ 
++def action_expert_action_out_proj(x, weight, bias, out, norm_factor, *, scratch):
++    """Update BF16 actions after FP32 factor/bias/residual; do not write norm_factor."""
++    rows = x.shape[0]
++    factor = scratch("pi05_action_out_factor", (rows,), x.dtype, x.device)
++    projected = scratch("pi05_action_out_projected", (rows, 32), x.dtype, x.device)
++    lib = _library()
++    stream = torch.cuda.current_stream(x.device).cuda_stream
++    rc = lib.pi05_action_out_factor_launch(x.data_ptr(), factor.data_ptr(), rows, stream)
++    if rc:
++        raise RuntimeError(f"pi05_action_out_factor rows={rows}, threads=256: CUDA error {rc}")
++    torch.mm(x, weight, out=projected)
++    rc = lib.pi05_action_out_update_launch(
++        projected.data_ptr(), factor.data_ptr(), bias.data_ptr(), out.data_ptr(), rows, stream)
++    if rc:
++        raise RuntimeError(f"pi05_action_out_update rows={rows}, threads=256: CUDA error {rc}")
++    return out
++
++
+ def make_wrappers(scratch, selected_names=None) -> dict:
+-    """Bind the selected expert QKV wrapper to this runner's scratch allocator."""
++    """Bind the selected expert projection wrappers to this runner's scratch allocator."""
+     names = NAMES if selected_names is None else selected_names
+-    wrappers = {"action_expert_norm_qkv_rope": action_expert_norm_qkv_rope}
++    wrappers = {"action_expert_norm_qkv_rope": action_expert_norm_qkv_rope,
++                "action_expert_action_out_proj": action_expert_action_out_proj}
+     return {name: partial(wrappers[name], scratch=scratch) for name in names}
+ 
+ 

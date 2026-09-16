@@ -1,6 +1,6 @@
-# Case index
+# RTX 5090 / Pi0.5 case index
 
-[中文](index.md) | [English](index.en.md)
+[All tasks](../../../README.en.md) · [Task overview](README.en.md) · [中文](index.md) | [English](index.en.md)
 
 There are 45 case units: **26 have corresponding Chinese and English six-stage narratives**, and 19 remain index entries. This update adds 14 cases, covering all 20 retained optimizations other than 023/024. Existing case 023 is preserved and translated; 024 is outside this expansion.
 

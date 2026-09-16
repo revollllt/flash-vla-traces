@@ -1,0 +1,272 @@
+commit 7204975acf63d657039d332a26d737eb583d7828
+Add explicit-mask backbone FFN bucket candidate
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+index 8148783..8bc144d 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+@@ -15,6 +15,7 @@ from . import fused_attention as _fused_attention
+ from . import triton_qk_attention as _triton_qk_attention
+ from . import fused_residual as _fused_residual
+ from . import cutlass_backbone as _cutlass_backbone
++from . import bucketed_backbone as _bucketed_backbone
+ from . import cutlass_vision as _cutlass_vision
+ from . import cutlass_expert_residual as _cutlass_expert_residual
+ from . import fused_vision as _fused_vision
+@@ -33,6 +34,7 @@ BACKENDS = {
+     "triton-qk-attention": _triton_qk_attention,
+     "fused-residual": _fused_residual,
+     "cutlass-backbone": _cutlass_backbone,
++    "bucketed-backbone": _bucketed_backbone,
+     "cutlass-vision": _cutlass_vision,
+     "cutlass-expert-residual": _cutlass_expert_residual,
+     "fused-vision": _fused_vision,
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/bucketed_backbone.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/bucketed_backbone.py
+new file mode 100644
+index 0000000..1b8871e
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/bucketed_backbone.py
+@@ -0,0 +1,135 @@
++"""Pi0.5 FFN with device-selected M896/M968 and fixed graph addresses.
++
++The mask is an explicit op argument. Both static plans are warmed and captured;
++their native entries select the active bucket from mask[896] on every replay.
++The physical tensors remain BF16 M968. This module only loads native libraries
++on the first real invocation, so declaration needs no CUDA context or compiler.
++"""
++from __future__ import annotations
++
++import ctypes
++import weakref
++
++import torch
++
++from flash_vla.runtime.ops import OpSpec, dual_gemm, gemm
++
++from . import cutlass_backbone, fused_backbone
++
++MASKED_CALL_SITES = {
++    "llm_backbone_norm_gated_ffn": "llm_backbone_norm_gated_ffn_masked",
++    "llm_backbone_ffn_down_residual": "llm_backbone_ffn_down_residual_masked",
++}
++OPS = (
++    OpSpec("llm_backbone_norm_gated_ffn_masked",
++           ("x", "gate_w", "up_w", "out", "x_norm", "mask"),
++           outputs=("out", "x_norm"), weights=("gate_w", "up_w"), aux=("x_norm",),
++           flops=dual_gemm("x", "gate_w")),
++    OpSpec("llm_backbone_ffn_down_residual_masked",
++           ("x", "weight", "out", "mask"), outputs=("out",), inout=("out",),
++           weights=("weight",), flops=gemm("x", "weight")),
++)
++NAMES = frozenset(MASKED_CALL_SITES.values())
++# Adjacent M128 tile boundaries for this Target's 968 physical prefix rows.
++_BUCKET_ROWS = (896, 968)
++
++
++def _library():
++    library = cutlass_backbone._library()
++    library.backbone_bucket_workspace.argtypes = [ctypes.c_int32] * 3
++    library.backbone_bucket_workspace.restype = ctypes.c_int64
++    library.backbone_bucket_plan.argtypes = (
++        [ctypes.c_int32] * 3 + [ctypes.c_float] + [ctypes.c_void_p] * 5
++        + [ctypes.POINTER(ctypes.c_void_p)])
++    library.backbone_bucket_plan.restype = ctypes.c_int32
++    library.backbone_bucket_run.argtypes = [ctypes.c_void_p] * 3
++    library.backbone_bucket_run.restype = ctypes.c_int32
++    library.backbone_bucket_destroy.argtypes = [ctypes.c_void_p]
++    library.backbone_bucket_destroy.restype = None
++    return library
++
++
++class _Plan:
++    """Own both static native plans and scratch workspaces for one pointer set."""
++
++    def __init__(self, library, scratch, a, b, output, beta, stream):
++        k, n = a.shape[1], b.shape[1]
++        self.tensors = (a, b, output)
++        self.handles, self.workspaces, self.destroy = [], [], []
++        for m in _BUCKET_ROWS:
++            size = library.backbone_bucket_workspace(m, k, n)
++            if size < 0:
++                cutlass_backbone._check(-size, "backbone_bucket_workspace")
++            # Calls are serial; separate roles keep each bucket's barriers distinct.
++            workspace = scratch(f"bucketed_backbone_workspace_{m}", (max(size, 1),),
++                                torch.uint8, a.device)
++            handle = ctypes.c_void_p()
++            cutlass_backbone._check(library.backbone_bucket_plan(
++                m, k, n, beta, a.data_ptr(), b.data_ptr(), output.data_ptr(),
++                workspace.data_ptr(), stream, ctypes.byref(handle)),
++                f"backbone_bucket_plan M={m} K={k} N={n} beta={beta}")
++            self.handles.append(handle)
++            self.workspaces.append(workspace)
++            self.destroy.append(weakref.finalize(self, library.backbone_bucket_destroy, handle))
++
++
++def make_wrappers(scratch, selected_names=None) -> dict:
++    """Build the M968 BF16 FFN wrappers with a BF16 prefix mask of length 968.
++
++    Up writes out (968,16384) and x_norm (968,2048); down accumulates into
++    out (968,2048). The explicit mask stays at one address but may change
++    between graph replays. Both plans and all workspace are created in warmup.
++    """
++    names = NAMES if selected_names is None else set(selected_names)
++    library = pointwise = None
++    plans = {}
++
++    def run_gemm(a, b, output, mask, *, beta, stream):
++        nonlocal library
++        key = (a.data_ptr(), b.data_ptr(), output.data_ptr(), beta)
++        plan = plans.get(key)
++        if plan is None:
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError("bucketed backbone pointer set was not warmed before capture")
++            if library is None:
++                library = _library()
++            plan = _Plan(library, scratch, a, b, output, beta, stream)
++            plans[key] = plan
++        for handle in plan.handles:
++            cutlass_backbone._check(
++                library.backbone_bucket_run(handle, mask.data_ptr(), stream),
++                "backbone_bucket_run")
++
++    def llm_backbone_norm_gated_ffn_masked(x, gate_w, up_w, out, x_norm, mask):
++        nonlocal pointwise
++        if pointwise is None:
++            pointwise = fused_backbone._library()
++            pointwise.backbone_masked_gelu_mul.argtypes = [
++                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64,
++                ctypes.c_void_p, ctypes.c_void_p,
++            ]
++            pointwise.backbone_masked_gelu_mul.restype = ctypes.c_int32
++        rows = x.shape[0]
++        normed, result = x_norm[:rows], out[:rows]
++        gate = scratch("backbone_ffn_gate", result.shape, x.dtype, x.device)
++        stream = torch.cuda.current_stream().cuda_stream
++        cutlass_backbone._check(pointwise.backbone_rms_norm(
++            x.data_ptr(), normed.data_ptr(), rows, stream), "backbone_rms_norm")
++        run_gemm(normed, gate_w, gate, mask, beta=0.0, stream=stream)
++        run_gemm(normed, up_w, result, mask, beta=0.0, stream=stream)
++        # The short bucket zeroes the tail before any stale gate/up load.
++        cutlass_backbone._check(pointwise.backbone_masked_gelu_mul(
++            gate.data_ptr(), result.data_ptr(), result.numel(), mask.data_ptr(), stream),
++            "backbone_masked_gelu_mul")
++        return out
++
++    def llm_backbone_ffn_down_residual_masked(x, weight, out, mask):
++        run_gemm(x, weight, out, mask, beta=1.0,
++                 stream=torch.cuda.current_stream().cuda_stream)
++        return out
++
++    wrappers = {
++        "llm_backbone_norm_gated_ffn_masked": llm_backbone_norm_gated_ffn_masked,
++        "llm_backbone_ffn_down_residual_masked": llm_backbone_ffn_down_residual_masked,
++    }
++    return {name: wrappers[name] for name in names}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.py
+index d96a83c..0a05bdc 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.py
+@@ -17,7 +17,10 @@ import torch
+ 
+ from . import fused_backbone
+ 
+-NAMES = frozenset({"llm_backbone_norm_gated_ffn", "llm_backbone_ffn_down_residual"})
++NAMES = frozenset({
++    "llm_backbone_norm_gated_ffn", "llm_backbone_ffn_down_residual",
++    "llm_backbone_norm_gated_ffn_masked", "llm_backbone_ffn_down_residual_masked",
++})
+ _SOURCE = Path(__file__).with_suffix(".cu")
+ 
+ 
+@@ -136,8 +139,16 @@ def make_wrappers(scratch, selected_names=None) -> dict:
+         gemm(x, weight, out, beta=1.0, stream=torch.cuda.current_stream().cuda_stream)
+         return out
+ 
++    def llm_backbone_norm_gated_ffn_masked(x, gate_w, up_w, out, x_norm, mask):
++        return llm_backbone_norm_gated_ffn(x, gate_w, up_w, out, x_norm)
++
++    def llm_backbone_ffn_down_residual_masked(x, weight, out, mask):
++        return llm_backbone_ffn_down_residual(x, weight, out)
++
+     wrappers = {
+         "llm_backbone_norm_gated_ffn": llm_backbone_norm_gated_ffn,
+         "llm_backbone_ffn_down_residual": llm_backbone_ffn_down_residual,
++        "llm_backbone_norm_gated_ffn_masked": llm_backbone_norm_gated_ffn_masked,
++        "llm_backbone_ffn_down_residual_masked": llm_backbone_ffn_down_residual_masked,
+     }
+     return {name: wrappers[name] for name in names}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/torch_ops.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/torch_ops.py
+index 880fb38..06b3176 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/torch_ops.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/torch_ops.py
+@@ -13,6 +13,11 @@ from flash_vla.hardware.nvidia.h100.pi05.backends.tilelang.wrappers import (
+     ROUTE_CONSTRAINTS,
+ )
+ 
++NAMES = NAMES | {
++    "llm_backbone_norm_gated_ffn_masked",
++    "llm_backbone_ffn_down_residual_masked",
++}
++
+ #: Mirrored from the TileLang wrappers so this module reads on its own.
+ VISION_TOKENS = 256
+ VISION_DIM = 1152
+@@ -263,6 +268,14 @@ def action_expert_action_out_proj(x, weight, bias, out, norm_factor):
+     return out
+ 
+ 
++def llm_backbone_norm_gated_ffn_masked(x, gate_w, up_w, out, x_norm, mask):
++    return llm_backbone_norm_gated_ffn(x, gate_w, up_w, out, x_norm)
++
++
++def llm_backbone_ffn_down_residual_masked(x, weight, out, mask):
++    return llm_backbone_ffn_down_residual(x, weight, out)
++
++
+ ALL_WRAPPERS = {
+     name: obj for name, obj in list(globals().items())
+     if callable(obj) and not name.startswith("_") and name in NAMES
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index b99bbe2..f9e6328 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -5,11 +5,14 @@ backend routing and CUDA kernels belong to this hardware Target.
+ """
+ from __future__ import annotations
+ 
++from dataclasses import replace
+ from typing import Any, Mapping
+ 
+ from flash_vla.hardware.nvidia.h100.pi05.target import Pi05, forward_prefix, set_task
++from flash_vla.runtime.graph import Graph
+ 
+ from .backends import REGISTRY
++from .backends.bucketed_backbone import MASKED_CALL_SITES
+ 
+ 
+ class Pi05RTX5090(Pi05):
+@@ -45,6 +48,24 @@ class Pi05RTX5090(Pi05):
+     }
+     reference_plan: Mapping[str, str] = {}
+ 
++    def build(self, g: Graph, shape: Mapping[str, int]) -> None:
++        super().build(g, shape)
++        mask = g.buf("mask_bias")[:shape["prefix_len"]]
++        for index, node in enumerate(g.nodes):
++            if node.call_site in MASKED_CALL_SITES:
++                g.nodes[index] = replace(
++                    node, call_site=MASKED_CALL_SITES[node.call_site],
++                    args=(*node.args, mask))
++
++    def select_plan(self, plan: Any) -> dict[str, str]:
++        routes = super().select_plan(plan)
++        # Saved dense plans use standard names; explicit masked routes override them.
++        for original, masked in MASKED_CALL_SITES.items():
++            if original in routes:
++                backend = routes.pop(original)
++                routes.setdefault(masked, backend)
++        return routes
++
+     #: H100's `action_expert_norm_gated_ffn` ceiling is a measured H100 number
+     #: (`tma.bw.dev.burst`, job 591174) and says nothing about this part. Cleared
+     #: rather than inherited; the floor model falls back to this machine's own

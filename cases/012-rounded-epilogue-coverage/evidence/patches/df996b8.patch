@@ -1,0 +1,36 @@
+commit df996b832f9a6de1250f0d6193544abeb1b5bc31
+Deploy rounded expert down epilogue on RTX 5090 Pi0.5
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+index b060e7d..9274fae 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+@@ -11,6 +11,7 @@ from . import packed_ffn as _packed_ffn
+ from . import fused_attention as _fused_attention
+ from . import fused_residual as _fused_residual
+ from . import cutlass_backbone as _cutlass_backbone
++from . import cutlass_expert_residual as _cutlass_expert_residual
+ from . import fused_vision as _fused_vision
+ from . import fused_prefix_qkv as _fused_prefix_qkv
+ 
+@@ -23,6 +24,7 @@ BACKENDS = {
+     "fused-attention": _fused_attention,
+     "fused-residual": _fused_residual,
+     "cutlass-backbone": _cutlass_backbone,
++    "cutlass-expert-residual": _cutlass_expert_residual,
+     "fused-vision": _fused_vision,
+     "fused-prefix-qkv": _fused_prefix_qkv,
+ }
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index 07b3ace..bc4a82d 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -38,7 +38,7 @@ class Pi05RTX5090(Pi05):
+         "llm_backbone_ffn_down_residual": "cutlass-backbone",
+         "action_expert_attention": "fused-attention",
+         "action_expert_out_proj_residual": "fused-residual",
+-        "action_expert_ffn_down_residual": "fused-residual",
++        "action_expert_ffn_down_residual": "cutlass-expert-residual",
+         "action_expert_action_out_proj": "fused-qkv",
+     }
+     reference_plan: Mapping[str, str] = {}

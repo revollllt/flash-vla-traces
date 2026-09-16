@@ -1,0 +1,20 @@
+{"native_library": "/home/ubuntu/flash-vla/.cache/cuda_ext/rtx5090_pi0_cutlass_3b9ae13bbaa360d9/libcutlass_gemm.so", "configs": {"0": {"tile": [128, 128, 64], "warp": [64, 64, 64], "stages": 3}, "1": {"tile": [128, 64, 64], "warp": [64, 32, 64], "stages": 4}, "2": {"tile": [64, 128, 64], "warp": [32, 64, 64], "stages": 4}, "3": {"tile": [64, 64, 64], "warp": [32, 32, 64], "stages": 5}, "4": {"tile": [32, 64, 64], "warp": [32, 32, 64], "stages": 6}, "5": {"tile": [128, 128, 32], "warp": [64, 64, 32], "stages": 4}, "6": {"tile": [32, 128, 32], "warp": [32, 64, 32], "stages": 5}, "7": {"tile": [16, 128, 64], "warp": [16, 64, 64], "stages": 4}, "8": {"tile": [64, 64, 32], "warp": [32, 32, 32], "stages": 6}, "9": {"tile": [32, 64, 32], "warp": [32, 32, 32], "stages": 8}, "10": {"tile": [64, 128, 32], "warp": [32, 64, 32], "stages": 5}, "11": {"tile": [32, 128, 32], "warp": [32, 32, 32], "stages": 4}}}
+{"site": "packed_ffn", "route": "torch_before", "samples_ms": [0.014988443917698331, 0.013948443863126967, 0.013934221532609727, 0.01401422255569034, 0.013870221873124441, 0.013797333670987023, 0.013756444056828817, 0.013815110756291283, 0.013872000078360239, 0.013804444836245643, 0.013806222213639153, 0.0136835558546914, 0.013818666338920593, 0.013742222554153867, 0.013754666679435305], "median_ms": 0.013815110756291283}
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/ubuntu/flash-vla-gpt6-backbone/lab/pi05/cutlass_expert_screen.py", line 170, in <module>
+    main()
+  File "/home/ubuntu/flash-vla-gpt6-backbone/lab/pi05/cutlass_expert_screen.py", line 159, in main
+    results.append(screen(cg, label, calls[label], configs, samples_ms,
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/flash-vla-gpt6-backbone/lab/pi05/cutlass_expert_screen.py", line 92, in screen
+    function()
+  File "/home/ubuntu/flash-vla-gpt6-backbone/lab/pi05/cutlass_expert_screen.py", line 90, in <lambda>
+    functions = [lambda plan=plan: cg.run(plan) for plan in plans]
+                                   ^^^^^^^^^^^^
+  File "/home/ubuntu/flash-vla/src/flash_vla/hardware/nvidia/rtx5090/pi0/backends/cuda/cutlass_gemm.py", line 198, in run
+    _check(library().cutlass_gemm_run(planned[0], _stream()), "cutlass_gemm_run")
+  File "/home/ubuntu/flash-vla/src/flash_vla/hardware/nvidia/rtx5090/pi0/backends/cuda/cutlass_gemm.py", line 134, in _check
+    raise RuntimeError(f"{what} failed: cuda error {status}")
+RuntimeError: cutlass_gemm_run failed: cuda error 719

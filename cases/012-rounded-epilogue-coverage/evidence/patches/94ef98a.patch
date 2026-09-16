@@ -1,0 +1,251 @@
+commit 94ef98abf071e300cd23d52bac291f5d2a97264e
+Add rounded CUTLASS epilogue for Pi0.5 expert down
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.cu b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.cu
+index 44b9cec..83970ff 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.cu
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.cu
+@@ -6,6 +6,7 @@
+ #include "cutlass/cutlass.h"
+ #include "cutlass/epilogue/thread/linear_combination.h"
+ #include "cutlass/gemm/device/gemm_universal.h"
++#include "cutlass/gemm/device/gemm_universal_streamk_with_broadcast.h"
+ #include "cutlass/gemm/threadblock/threadblock_swizzle_streamk.h"
+ 
+ namespace {
+@@ -31,6 +32,108 @@ Gemm::Arguments arguments(int32_t m, int32_t k, int32_t n, float beta,
+ 
+ // Keep CUTLASS status values distinct from cudaError_t at the C boundary.
+ constexpr int32_t kCutlassError = 1000;
++
++// The Stream-K broadcast epilogue receives the fully reduced FP32 accumulator.
++// Preserve the separate BF16 GEMM store numerically before gate/residual math.
++class RoundedGatedResidual {
++ public:
++  using ElementOutput = Element;
++  using ElementAccumulator = float;
++  using ElementCompute = float;
++  using ElementT = Element;
++  using ElementVector = Element;
++  static constexpr int kCount = 8;
++  static constexpr bool kIsHeavy = false;
++  static constexpr bool kIsSingleSource = true;
++  static constexpr bool kStoreZ = true;
++  static constexpr bool kStoreT = false;
++  using FragmentOutput = cutlass::Array<Element, kCount>;
++  using FragmentAccumulator = cutlass::Array<float, kCount>;
++  using FragmentCompute = cutlass::Array<float, kCount>;
++  struct Params {};
++
++  CUTLASS_HOST_DEVICE explicit RoundedGatedResidual(Params const&) {}
++  CUTLASS_HOST_DEVICE bool is_source_needed() const { return true; }
++  CUTLASS_HOST_DEVICE void set_k_partition(int, int) {}
++
++  CUTLASS_DEVICE void operator()(
++      FragmentOutput& result, FragmentOutput&, FragmentAccumulator const& accum,
++      FragmentOutput const& residual, FragmentCompute const& gate) const {
++    cutlass::NumericArrayConverter<Element, float, kCount> round_bf16;
++    cutlass::NumericArrayConverter<float, Element, kCount> to_float;
++    const FragmentCompute projected = to_float(round_bf16(accum));
++    const FragmentCompute source = to_float(residual);
++    FragmentCompute updated;
++    CUTLASS_PRAGMA_UNROLL
++    for (int i = 0; i < kCount; ++i)
++      updated[i] = __fadd_rn(__fmul_rn(projected[i], gate[i]), source[i]);
++    result = round_bf16(updated);
++  }
++
++  // Required by the broadcast concept; the selected route always reads C.
++  CUTLASS_DEVICE void operator()(
++      FragmentOutput& result, FragmentOutput&, FragmentAccumulator const& accum,
++      FragmentCompute const& gate) const {
++    cutlass::NumericArrayConverter<Element, float, kCount> round_bf16;
++    cutlass::NumericArrayConverter<float, Element, kCount> to_float;
++    const FragmentCompute projected = to_float(round_bf16(accum));
++    FragmentCompute updated;
++    CUTLASS_PRAGMA_UNROLL
++    for (int i = 0; i < kCount; ++i) updated[i] = __fmul_rn(projected[i], gate[i]);
++    result = round_bf16(updated);
++  }
++};
++
++// Config 9: one new template type in the existing native library. The unique
++// epilogue also keeps its per-kernel CUTLASS initialization state distinct.
++using DownDefaults = cutlass::gemm::device::GemmUniversalStreamkWithBroadcast<
++    Element, RowMajor, Element, RowMajor, Element, RowMajor, float,
++    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
++    cutlass::gemm::GemmShape<32, 64, 32>,
++    cutlass::gemm::GemmShape<32, 32, 32>,
++    cutlass::gemm::GemmShape<16, 8, 16>, RoundedGatedResidual,
++    cutlass::gemm::threadblock::ThreadblockSwizzleStreamK, 8, 8, 8>;
++
++using DownEpilogueBase = DownDefaults::GemmKernel::Epilogue;
++
++// epilogue_with_broadcast.h::reduce advances C by fragment index but omits Z.
++// M50 N1024 K4096 with the 32x64 tile then leaves later row fragments unwritten.
++// Mirror epilogue.h::reduce so each reduction block stores its own fragment.
++class DownEpilogue : public DownEpilogueBase {
++ public:
++  using DownEpilogueBase::DownEpilogueBase;
++
++  CUTLASS_DEVICE void reduce(
++      int peer_begin, int peer_end, int fragment, void* workspace,
++      OutputOp const& op, ElementVector const* gate,
++      OutputTileIterator destination, OutputTileIterator source,
++      TensorTileIterator tensor, cutlass::MatrixCoord const& problem,
++      cutlass::MatrixCoord const& offset) {
++    destination += fragment;
++    DownEpilogueBase::reduce(peer_begin, peer_end, fragment, workspace, op,
++                            gate, destination, source, tensor, problem, offset);
++  }
++};
++
++using DownGemm = cutlass::gemm::device::GemmUniversalBase<
++    cutlass::gemm::kernel::GemmStreamkWithFusedEpilogue<
++        DownDefaults::GemmKernel::Mma, DownEpilogue,
++        cutlass::gemm::threadblock::ThreadblockSwizzleStreamK>>;
++
++DownGemm::Arguments down_arguments(const void* a, const void* b, const void* gate,
++                                    void* output) {
++  DownGemm::Arguments args;
++  args.problem_size = {50, 1024, 4096};
++  args.ptr_A = a;
++  args.ptr_B = b;
++  args.ptr_C = output;
++  args.ptr_D = output;
++  args.ptr_Vector = const_cast<void*>(gate);
++  args.lda = 4096;
++  args.ldb = args.ldc = args.ldd = 1024;
++  args.ldr = 0;  // One gate vector broadcast over every output row.
++  return args;
++}
+ }  // namespace
+ 
+ extern "C" int64_t backbone_gemm_workspace(int32_t m, int32_t k, int32_t n) {
+@@ -66,3 +169,37 @@ extern "C" int32_t backbone_gemm_run(void* handle, void* stream) {
+ extern "C" void backbone_gemm_destroy(void* handle) {
+   delete static_cast<Gemm*>(handle);
+ }
++
++extern "C" int64_t expert_down_workspace() {
++  return static_cast<int64_t>(
++      DownGemm::get_workspace_size(down_arguments(nullptr, nullptr, nullptr, nullptr)));
++}
++
++extern "C" int32_t expert_down_plan(
++    const void* a, const void* b, const void* gate, void* output,
++    void* workspace, void* stream, void** handle) {
++  const auto args = down_arguments(a, b, gate, output);
++  cutlass::Status status = DownGemm::can_implement(args);
++  if (status != cutlass::Status::kSuccess)
++    return kCutlassError + static_cast<int32_t>(status);
++  auto* plan = new DownGemm;
++  status = plan->initialize(args, workspace, static_cast<cudaStream_t>(stream));
++  if (status != cutlass::Status::kSuccess) {
++    delete plan;
++    return kCutlassError + static_cast<int32_t>(status);
++  }
++  *handle = plan;
++  return 0;
++}
++
++extern "C" int32_t expert_down_run(void* handle, void* stream) {
++  const cutlass::Status status =
++      static_cast<DownGemm*>(handle)->run(static_cast<cudaStream_t>(stream));
++  if (status != cutlass::Status::kSuccess)
++    return kCutlassError + static_cast<int32_t>(status);
++  return static_cast<int32_t>(cudaGetLastError());
++}
++
++extern "C" void expert_down_destroy(void* handle) {
++  delete static_cast<DownGemm*>(handle);
++}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.py
+index 3afcca1..e7f2278 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_backbone.py
+@@ -52,6 +52,15 @@ def _library():
+     library.backbone_gemm_run.restype = ctypes.c_int32
+     library.backbone_gemm_destroy.argtypes = [ctypes.c_void_p]
+     library.backbone_gemm_destroy.restype = None
++    library.expert_down_workspace.argtypes = []
++    library.expert_down_workspace.restype = ctypes.c_int64
++    library.expert_down_plan.argtypes = [ctypes.c_void_p] * 6 + [
++        ctypes.POINTER(ctypes.c_void_p)]
++    library.expert_down_plan.restype = ctypes.c_int32
++    library.expert_down_run.argtypes = [ctypes.c_void_p] * 2
++    library.expert_down_run.restype = ctypes.c_int32
++    library.expert_down_destroy.argtypes = [ctypes.c_void_p]
++    library.expert_down_destroy.restype = None
+     return library
+ 
+ 
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_expert_residual.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_expert_residual.py
+new file mode 100644
+index 0000000..acc13b3
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/cutlass_expert_residual.py
+@@ -0,0 +1,63 @@
++"""Pi0.5 expert FFN down with a BF16-rounded CUTLASS gated residual epilogue."""
++from __future__ import annotations
++
++import ctypes
++import weakref
++
++import torch
++
++from .cutlass_backbone import _check, _library
++
++NAMES = ("action_expert_ffn_down_residual",)
++
++
++class _Plan:
++    def __init__(self, library, scratch, role, x, weight, gate, out, stream):
++        size = library.expert_down_workspace()
++        self.workspace = scratch(role, (max(size, 1),), torch.uint8, x.device)
++        self.tensors = (x, weight, gate, out)
++        self.handle = ctypes.c_void_p()
++        _check(library.expert_down_plan(
++            x.data_ptr(), weight.data_ptr(), gate.data_ptr(), out.data_ptr(),
++            self.workspace.data_ptr(), stream, ctypes.byref(self.handle)),
++            "expert_down_plan M=50 K=4096 N=1024")
++        self.destroy = weakref.finalize(self, library.expert_down_destroy, self.handle)
++
++
++def make_wrappers(scratch, selected_names=None) -> dict:
++    """Bind contiguous CUDA BF16 x(50,4096), weight(4096,1024), gate(1024,).
++
++    out(50,1024) is read and written in place, with a BF16-rounded GEMM result
++    before the separate FP32 multiply/add. Each closure owns native plans and
++    source references. Warmup must visit all pointer sets before graph capture;
++    its Stream-K scratch is shared serially and no projection buffer is needed.
++    Op-table construction needs no compiler or CUDA context.
++    """
++    names = set(NAMES) if selected_names is None else set(selected_names)
++    unknown = names - set(NAMES)
++    if unknown:
++        raise KeyError(f"expert residual backend does not implement {sorted(unknown)}")
++    library = None
++    plans = {}
++    role = f"pi05_expert_down_streamk_{id(plans)}"
++
++    def action_expert_ffn_down_residual(x, weight, gate, out):
++        nonlocal library
++        key = (x.data_ptr(), weight.data_ptr(), gate.data_ptr(), out.data_ptr())
++        plan = plans.get(key)
++        stream = torch.cuda.current_stream().cuda_stream
++        if plan is None:
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError("expert down pointer set was not warmed before capture")
++            if library is None:
++                library = _library()
++            plan = _Plan(library, scratch, role, x, weight, gate, out, stream)
++            plans[key] = plan
++        _check(library.expert_down_run(plan.handle, stream),
++               "expert_down_run M=50 K=4096 N=1024")
++        return out
++
++    return {name: action_expert_ffn_down_residual for name in names}
++
++
++__all__ = ["NAMES", "make_wrappers"]

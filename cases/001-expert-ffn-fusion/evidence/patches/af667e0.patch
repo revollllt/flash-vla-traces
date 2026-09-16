@@ -1,0 +1,203 @@
+commit af667e0ecd360b78c24b655ffe0ff69e9a798ded
+Fuse Pi0.5 RTX 5090 expert FFN pointwise stages
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.cu b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.cu
+new file mode 100644
+index 0000000..ac6ce6d
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.cu
+@@ -0,0 +1,95 @@
++// Pi0.5 expert FFN, M x 1024 -> M x 4096, contiguous bf16 tensors.
++// AdaRMS uses one 256-thread CTA per row, keeping its four values in registers.
++// The epilogue has no reduction; 256 threads process four columns apiece.
++#include <cstdint>
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++namespace {
++using bf16 = __nv_bfloat16;
++
++__device__ __forceinline__ float warp_sum(float value) {
++#pragma unroll
++  for (int32_t offset = 16; offset > 0; offset >>= 1)
++    value += __shfl_xor_sync(0xffffffffu, value, offset);
++  return value;
++}
++
++__global__ void ada_rms_kernel(const bf16 *__restrict__ x,
++                               const bf16 *__restrict__ scale,
++                               bf16 *__restrict__ a,
++                               bf16 *__restrict__ factor) {
++  const int32_t row = blockIdx.x;
++  const int32_t lane = threadIdx.x & 31;
++  const int32_t warp = threadIdx.x >> 5;
++  float values[4];
++  float sum = 0.f;
++#pragma unroll
++  for (int32_t i = 0; i < 4; ++i) {
++    values[i] = __bfloat162float(x[row * 1024 + threadIdx.x + i * 256]);
++    sum += values[i] * values[i];
++  }
++  sum = warp_sum(sum);
++  __shared__ float partial[8];
++  __shared__ float rounded_factor;
++  if (lane == 0) partial[warp] = sum;
++  // All eight warp sums must be visible before the first warp reduces them.
++  __syncthreads();
++  if (warp == 0) {
++    sum = warp_sum(lane < 8 ? partial[lane] : 0.f);
++    if (lane == 0) {
++      const bf16 f = __float2bfloat16_rn(rsqrtf(sum / 1024.f + 1e-6f));
++      factor[row] = f;
++      rounded_factor = __bfloat162float(f);
++    }
++  }
++  // Broadcast the rounded factor before consuming it in each activation.
++  __syncthreads();
++#pragma unroll
++  for (int32_t i = 0; i < 4; ++i) {
++    const int32_t col = threadIdx.x + i * 256;
++    const bf16 normalized = __float2bfloat16_rn(values[i] * rounded_factor);
++    a[row * 1024 + col] = __float2bfloat16_rn(
++        __bfloat162float(normalized) * __bfloat162float(scale[col]));
++  }
++}
++
++__global__ void gated_activation_kernel(const bf16 *__restrict__ gate,
++                                        const bf16 *__restrict__ up,
++                                        const bf16 *__restrict__ gate_bias,
++                                        const bf16 *__restrict__ up_bias,
++                                        bf16 *__restrict__ out, int32_t elements) {
++#pragma unroll
++  for (int32_t i = 0; i < 4; ++i) {
++    const int32_t index = blockIdx.x * 1024 + threadIdx.x + i * 256;
++    if (index < elements) {
++      const int32_t col = index % 4096;
++      const float g = __bfloat162float(gate[index]) + __bfloat162float(gate_bias[col]);
++      const float u = __bfloat162float(up[index]) + __bfloat162float(up_bias[col]);
++      // Match torch's fp32 approximate="tanh" expression before bf16 output.
++      const float cube = g * g * g;
++      const float gelu = 0.5f * g * (1.f + tanhf(0.7978845608028654f *
++                                               (g + 0.044715f * cube)));
++      out[index] = __float2bfloat16_rn(gelu * u);
++    }
++  }
++}
++}  // namespace
++
++extern "C" int32_t ada_rms_launch(const void *x, const void *scale, void *a,
++                                   void *factor, int32_t rows, void *stream) {
++  ada_rms_kernel<<<rows, 256, 0, static_cast<cudaStream_t>(stream)>>>(
++      static_cast<const bf16 *>(x), static_cast<const bf16 *>(scale),
++      static_cast<bf16 *>(a), static_cast<bf16 *>(factor));
++  return static_cast<int32_t>(cudaGetLastError());
++}
++
++extern "C" int32_t gated_activation_launch(const void *gate, const void *up,
++                                            const void *gate_bias, const void *up_bias,
++                                            void *out, int32_t rows, void *stream) {
++  gated_activation_kernel<<<rows * 4, 256, 0, static_cast<cudaStream_t>(stream)>>>(
++      static_cast<const bf16 *>(gate), static_cast<const bf16 *>(up),
++      static_cast<const bf16 *>(gate_bias), static_cast<const bf16 *>(up_bias),
++      static_cast<bf16 *>(out), rows * 4096);
++  return static_cast<int32_t>(cudaGetLastError());
++}
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.py
+new file mode 100644
+index 0000000..4601c36
+--- /dev/null
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/fused_ffn.py
+@@ -0,0 +1,93 @@
++"""Pi0.5 expert FFN with hand-written AdaRMS and gated-activation stages.
++
++The two GEMMs remain torch.mm. The CUDA stages preserve the torch route's
++bf16 factor, two bf16 activation multiplications and bf16 GEMM outputs.
++"""
++from __future__ import annotations
++
++import ctypes
++from functools import lru_cache
++import os
++from pathlib import Path
++import shutil
++import subprocess
++
++import torch
++
++NAMES = ("action_expert_norm_gated_ffn",)
++_HERE = Path(__file__).resolve().parent
++
++
++@lru_cache(maxsize=1)
++def _library():
++    """Build before graph capture; retain only the host library globally."""
++    source = _HERE / "fused_ffn.cu"
++    directory = _HERE.parents[6] / ".cache" / "cuda_ext" / "rtx5090_pi05_fused_ffn"
++    directory.mkdir(parents=True, exist_ok=True)
++    output = directory / "libfused_ffn.so"
++    if not output.exists() or output.stat().st_mtime_ns < max(
++            source.stat().st_mtime_ns, Path(__file__).stat().st_mtime_ns):
++        cuda_home = os.environ.get("CUDA_HOME")
++        nvcc = os.environ.get("FLASH_VLA_NVCC") or (
++            str(Path(cuda_home) / "bin" / "nvcc") if cuda_home else shutil.which("nvcc"))
++        if nvcc is None:
++            raise RuntimeError("Pi0.5 fused FFN requires nvcc on PATH or CUDA_HOME")
++        subprocess.run([nvcc, "-O3", "-std=c++17", "--fmad=false", "--shared",
++                        "-Xcompiler", "-fPIC", "-arch=sm_120", str(source),
++                        "-o", str(output)], check=True)
++    lib = ctypes.CDLL(str(output))
++    lib.ada_rms_launch.argtypes = [ctypes.c_void_p] * 4 + [
++        ctypes.c_int32, ctypes.c_void_p]
++    lib.ada_rms_launch.restype = ctypes.c_int32
++    lib.gated_activation_launch.argtypes = [ctypes.c_void_p] * 5 + [
++        ctypes.c_int32, ctypes.c_void_p]
++    lib.gated_activation_launch.restype = ctypes.c_int32
++    return lib
++
++
++def _check(status: int, kernel: str, rows: int) -> None:
++    if status != 0:
++        raise RuntimeError(f"{kernel}(rows={rows}) failed: cudaError {status}")
++
++
++def make_wrappers(scratch, selected_names=None) -> dict:
++    """Bind scratch-owned workspaces for contiguous CUDA bf16 Mx1024 -> Mx4096.
++
++    Scale is (1024,), both weights are (1024, 4096), and biases are (4096,).
++    The wrapper writes ``out`` and ``norm_factor``. Warmup allocates buffers
++    and builds the library before scratch freezes and CUDA graph capture starts.
++    Each factory call owns its workspaces; no device tensors are module globals.
++    """
++    names = set(NAMES) if selected_names is None else set(selected_names)
++    unknown = names - set(NAMES)
++    if unknown:
++        raise KeyError(f"fused FFN backend does not implement {sorted(unknown)}")
++    workspaces = {}
++    role = f"pi05_fused_ffn_{id(workspaces)}"
++
++    def action_expert_norm_gated_ffn(x, scale, gate_w, up_w, gate_b, up_b,
++                                     out, norm_factor):
++        rows = x.shape[0]
++        key = (rows, x.dtype, x.device)
++        if key not in workspaces:
++            workspaces[key] = (
++                scratch(role + "_a", (rows, 1024), x.dtype, x.device),
++                scratch(role + "_gate", (rows, 4096), x.dtype, x.device),
++                scratch(role + "_up", (rows, 4096), x.dtype, x.device),
++            )
++        a, gate, up = workspaces[key]
++        lib = _library()
++        stream = torch.cuda.current_stream().cuda_stream
++        _check(lib.ada_rms_launch(x.data_ptr(), scale.data_ptr(), a.data_ptr(),
++                                 norm_factor.data_ptr(), rows, stream), "ada_rms", rows)
++        torch.mm(a, gate_w, out=gate)
++        torch.mm(a, up_w, out=up)
++        _check(lib.gated_activation_launch(
++            gate.data_ptr(), up.data_ptr(), gate_b.data_ptr(), up_b.data_ptr(),
++            out.data_ptr(), rows, stream), "gated_activation", rows)
++        return out
++
++    return {name: action_expert_norm_gated_ffn for name in names}
++
++
++__all__ = ["NAMES", "make_wrappers"]

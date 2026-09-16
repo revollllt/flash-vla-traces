@@ -1,0 +1,36 @@
+commit 594e6975370e151b235a78277f288eacb3270e93
+Deploy CUTLASS backbone gate and up GEMMs on RTX 5090 Pi0.5
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+index 157521e..d9007a7 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+@@ -10,6 +10,7 @@ from . import fused_backbone as _fused_backbone
+ from . import packed_ffn as _packed_ffn
+ from . import fused_attention as _fused_attention
+ from . import fused_residual as _fused_residual
++from . import cutlass_backbone as _cutlass_backbone
+ 
+ BACKENDS = {
+     "torch": _torch,
+@@ -19,6 +20,7 @@ BACKENDS = {
+     "packed-ffn": _packed_ffn,
+     "fused-attention": _fused_attention,
+     "fused-residual": _fused_residual,
++    "cutlass-backbone": _cutlass_backbone,
+ }
+ 
+ REGISTRY = Registry(BACKENDS, default="torch")
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index 152a761..f8accaf 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -31,7 +31,7 @@ class Pi05RTX5090(Pi05):
+     plan: Mapping[str, str] = {
+         "action_expert_norm_gated_ffn": "packed-ffn",
+         "action_expert_norm_qkv_rope": "fused-qkv",
+-        "llm_backbone_norm_gated_ffn": "fused-backbone",
++        "llm_backbone_norm_gated_ffn": "cutlass-backbone",
+         "action_expert_attention": "fused-attention",
+         "action_expert_out_proj_residual": "fused-residual",
+         "action_expert_ffn_down_residual": "fused-residual",

@@ -1,0 +1,36 @@
+commit 34add1bc19f1b8bee46e10689e2b8a0af5363c7d
+Route expert attention through the single-launch PV backend
+
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+index 331fb40..3b61b68 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/backends/__init__.py
+@@ -10,6 +10,7 @@ from . import fused_backbone as _fused_backbone
+ from . import packed_ffn as _packed_ffn
+ from . import dual_ffn as _dual_ffn
+ from . import fused_attention as _fused_attention
++from . import triton_attention as _triton_attention
+ from . import fused_residual as _fused_residual
+ from . import cutlass_backbone as _cutlass_backbone
+ from . import cutlass_vision as _cutlass_vision
+@@ -25,6 +26,7 @@ BACKENDS = {
+     "packed-ffn": _packed_ffn,
+     "dual-ffn": _dual_ffn,
+     "fused-attention": _fused_attention,
++    "triton-attention": _triton_attention,
+     "fused-residual": _fused_residual,
+     "cutlass-backbone": _cutlass_backbone,
+     "cutlass-vision": _cutlass_vision,
+diff --git a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+index e8a70aa..8c12cfb 100644
+--- a/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
++++ b/src/flash_vla/hardware/nvidia/rtx5090/pi05/target.py
+@@ -38,7 +38,7 @@ class Pi05RTX5090(Pi05):
+         "llm_backbone_norm_qkv_rope": "fused-prefix-qkv",
+         "llm_backbone_norm_gated_ffn": "cutlass-backbone",
+         "llm_backbone_ffn_down_residual": "cutlass-backbone",
+-        "action_expert_attention": "fused-attention",
++        "action_expert_attention": "triton-attention",
+         "action_expert_out_proj_residual": "cutlass-expert-residual",
+         "action_expert_ffn_down_residual": "cutlass-expert-residual",
+         "action_expert_action_out_proj": "fused-qkv",
